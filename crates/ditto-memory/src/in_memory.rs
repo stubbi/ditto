@@ -18,8 +18,9 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill, Node,
-    NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId, SkillStatus, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill,
+    NewTmrCue, Node, NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId,
+    SkillStatus, TenantId, TmrCue, TmrCueId,
 };
 
 use crate::embedder::cosine;
@@ -59,6 +60,8 @@ struct Inner {
     /// (tenant_id, event_id) -> salience. Defaults to 0.5 when absent;
     /// the salience-aware methods materialize the row on first set/bump.
     salience: HashMap<(TenantId, EventId), f32>,
+    /// cue_id -> cue. Vec retrieval orders by set_at.
+    tmr_cues: HashMap<TmrCueId, TmrCue>,
 }
 
 impl InMemoryStorage {
@@ -160,6 +163,7 @@ impl Storage for InMemoryStorage {
         inner.labile.retain(|(t, _), _| *t != tenant_id);
         inner.shadows.retain(|(t, _), _| *t != tenant_id);
         inner.salience.retain(|(t, _), _| *t != tenant_id);
+        inner.tmr_cues.retain(|_, c| c.tenant_id != tenant_id);
         Ok(())
     }
 
@@ -821,6 +825,59 @@ impl Storage for InMemoryStorage {
             }
         }
         Ok(affected)
+    }
+
+    async fn push_tmr_cue(&self, cue: NewTmrCue) -> StorageResult<TmrCue> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.tmr_cues.get(&cue.cue_id) {
+            return Ok(existing.clone());
+        }
+        let record = TmrCue {
+            cue_id: cue.cue_id,
+            tenant_id: cue.tenant_id,
+            scope_id: cue.scope_id,
+            focus: cue.focus,
+            hint: cue.hint,
+            set_at: Utc::now(),
+            consumed_at: None,
+        };
+        inner.tmr_cues.insert(cue.cue_id, record.clone());
+        Ok(record)
+    }
+
+    async fn pending_tmr_cues(&self, tenant_id: TenantId) -> StorageResult<Vec<TmrCue>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<TmrCue> = inner
+            .tmr_cues
+            .values()
+            .filter(|c| c.tenant_id == tenant_id && c.consumed_at.is_none())
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.set_at.cmp(&b.set_at).then(a.cue_id.0.cmp(&b.cue_id.0)));
+        Ok(out)
+    }
+
+    async fn mark_tmr_cue_consumed(
+        &self,
+        cue_id: TmrCueId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(c) = inner.tmr_cues.get_mut(&cue_id) {
+            if c.consumed_at.is_none() {
+                c.consumed_at = Some(at);
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_tmr_cues(&self, tenant_id: TenantId) -> StorageResult<u32> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.tmr_cues.len();
+        inner
+            .tmr_cues
+            .retain(|_, c| !(c.tenant_id == tenant_id && c.consumed_at.is_none()));
+        Ok((before - inner.tmr_cues.len()) as u32)
     }
 
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {

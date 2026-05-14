@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill, Node,
-    NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId, SkillStatus, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill,
+    NewTmrCue, Node, NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId,
+    SkillStatus, TenantId, TmrCue, TmrCueId,
 };
 
 use crate::search::{SearchQuery, SearchResult, VectorSearchQuery};
@@ -367,6 +368,27 @@ pub trait Storage: Send + Sync {
         tenant_id: TenantId,
         factor: f32,
     ) -> StorageResult<u32>;
+
+    // --- Targeted Memory Reactivation cues ---
+
+    /// Persist a cue. `set_at` is filled by the backend at insert time and
+    /// `consumed_at` starts NULL. Idempotent on `cue_id`.
+    async fn push_tmr_cue(&self, cue: NewTmrCue) -> StorageResult<TmrCue>;
+
+    /// Pending (not-yet-consumed) cues for a tenant, oldest first. The dream
+    /// cycle opens with this read on every run.
+    async fn pending_tmr_cues(&self, tenant_id: TenantId) -> StorageResult<Vec<TmrCue>>;
+
+    /// Mark a cue consumed at `at`. Idempotent on already-consumed rows.
+    async fn mark_tmr_cue_consumed(
+        &self,
+        cue_id: TmrCueId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()>;
+
+    /// Drop every pending cue for `tenant_id`. Returns the count cleared.
+    /// Used by the `clear_tmr_cues` controller surface.
+    async fn clear_tmr_cues(&self, tenant_id: TenantId) -> StorageResult<u32>;
 }
 
 /// Side effects of a cascade delete — folded into the DeletionProof payload

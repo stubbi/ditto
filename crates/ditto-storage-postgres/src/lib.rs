@@ -16,9 +16,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill, Node,
-    NodeId, Receipt, Reflective, ReflectiveId, ScopeId, SchemaVersion, Signature, Skill, SkillId,
-    SkillStatus, Slot, SupersedePolicy, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill,
+    NewTmrCue, Node, NodeId, Receipt, Reflective, ReflectiveId, ScopeId, SchemaVersion, Signature,
+    Skill, SkillId, SkillStatus, Slot, SupersedePolicy, TenantId, TmrCue, TmrCueId,
 };
 use ditto_memory::search::{SearchQuery, SearchResult, VectorSearchQuery};
 use ditto_memory::storage::{CascadeReport, Storage, StorageError, StorageResult};
@@ -268,6 +268,11 @@ impl Storage for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Other(format!("reset event_shadow: {e}")))?;
+        sqlx::query("DELETE FROM tmr_cue WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset tmr_cue: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| StorageError::Other(format!("reset commit: {e}")))?;
@@ -1209,6 +1214,78 @@ impl Storage for PostgresStorage {
         rows.into_iter().map(row_to_event).collect()
     }
 
+    async fn push_tmr_cue(&self, cue: NewTmrCue) -> StorageResult<TmrCue> {
+        // Idempotent on cue_id. Use ON CONFLICT DO NOTHING + a follow-up SELECT;
+        // RETURNING-with-ON-CONFLICT-DO-NOTHING returns 0 rows on conflict, so
+        // we read the existing row explicitly to match the in-memory contract.
+        sqlx::query(
+            r#"INSERT INTO tmr_cue (cue_id, tenant_id, scope_id, focus, hint)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (cue_id) DO NOTHING"#,
+        )
+        .bind(cue.cue_id.0)
+        .bind(cue.tenant_id.0)
+        .bind(cue.scope_id.map(|s| s.0))
+        .bind(&cue.focus)
+        .bind(cue.hint.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("push_tmr_cue: {e}")))?;
+
+        let row = sqlx::query(
+            r#"SELECT cue_id, tenant_id, scope_id, focus, hint, set_at, consumed_at
+               FROM tmr_cue WHERE cue_id = $1"#,
+        )
+        .bind(cue.cue_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("push_tmr_cue read: {e}")))?
+        .ok_or_else(|| StorageError::Other("tmr_cue vanished after insert".into()))?;
+        row_to_tmr_cue(row)
+    }
+
+    async fn pending_tmr_cues(&self, tenant_id: TenantId) -> StorageResult<Vec<TmrCue>> {
+        let rows = sqlx::query(
+            r#"SELECT cue_id, tenant_id, scope_id, focus, hint, set_at, consumed_at
+               FROM tmr_cue
+               WHERE tenant_id = $1 AND consumed_at IS NULL
+               ORDER BY set_at, cue_id"#,
+        )
+        .bind(tenant_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("pending_tmr_cues: {e}")))?;
+        rows.into_iter().map(row_to_tmr_cue).collect()
+    }
+
+    async fn mark_tmr_cue_consumed(
+        &self,
+        cue_id: TmrCueId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        sqlx::query(
+            r#"UPDATE tmr_cue SET consumed_at = $2
+               WHERE cue_id = $1 AND consumed_at IS NULL"#,
+        )
+        .bind(cue_id.0)
+        .bind(at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("mark_tmr_cue_consumed: {e}")))?;
+        Ok(())
+    }
+
+    async fn clear_tmr_cues(&self, tenant_id: TenantId) -> StorageResult<u32> {
+        let n = sqlx::query(
+            "DELETE FROM tmr_cue WHERE tenant_id = $1 AND consumed_at IS NULL",
+        )
+        .bind(tenant_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("clear_tmr_cues: {e}")))?;
+        Ok(u32::try_from(n.rows_affected()).unwrap_or(u32::MAX))
+    }
+
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {
         let vector_lit = embedding_to_pg_literal(&query.embedding);
         let sources = query.sources.as_deref().map(|s| s.to_vec());
@@ -1531,6 +1608,39 @@ fn row_to_skill(tenant_id: TenantId, row: sqlx::postgres::PgRow) -> StorageResul
         last_used,
         tests_pass,
         status,
+    })
+}
+
+fn row_to_tmr_cue(row: sqlx::postgres::PgRow) -> StorageResult<TmrCue> {
+    let cue_id: uuid::Uuid = row
+        .try_get("cue_id")
+        .map_err(|e| StorageError::Other(format!("cue_id col: {e}")))?;
+    let tenant_id: uuid::Uuid = row
+        .try_get("tenant_id")
+        .map_err(|e| StorageError::Other(format!("tenant_id col: {e}")))?;
+    let scope_id: Option<uuid::Uuid> = row
+        .try_get("scope_id")
+        .map_err(|e| StorageError::Other(format!("scope_id col: {e}")))?;
+    let focus: String = row
+        .try_get("focus")
+        .map_err(|e| StorageError::Other(format!("focus col: {e}")))?;
+    let hint: Option<String> = row
+        .try_get("hint")
+        .map_err(|e| StorageError::Other(format!("hint col: {e}")))?;
+    let set_at: DateTime<Utc> = row
+        .try_get("set_at")
+        .map_err(|e| StorageError::Other(format!("set_at col: {e}")))?;
+    let consumed_at: Option<DateTime<Utc>> = row
+        .try_get("consumed_at")
+        .map_err(|e| StorageError::Other(format!("consumed_at col: {e}")))?;
+    Ok(TmrCue {
+        cue_id: TmrCueId(cue_id),
+        tenant_id: TenantId(tenant_id),
+        scope_id: scope_id.map(ScopeId),
+        focus,
+        hint,
+        set_at,
+        consumed_at,
     })
 }
 

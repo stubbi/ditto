@@ -16,6 +16,7 @@ pub mod id;
 pub mod reflective;
 pub mod signing;
 pub mod skill;
+pub mod tmr;
 pub mod types;
 
 pub use blob::{Blob, BlobHash};
@@ -25,6 +26,7 @@ pub use id::{EventId, ScopeId, TenantId};
 pub use reflective::{NewReflective, Reflective, ReflectiveId};
 pub use signing::{InstallKey, Signature, VerifyingKey};
 pub use skill::{NewSkill, Skill, SkillId, SkillStatus};
+pub use tmr::{NewTmrCue, TmrCue, TmrCueId};
 pub use types::{Event, Receipt, SchemaVersion, Slot};
 
 /// The schema version emitted by this crate. Increment when the canonical
