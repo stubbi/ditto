@@ -46,9 +46,16 @@ pub struct MemoryController<S: Storage> {
 
 impl<S: Storage> MemoryController<S> {
     pub fn new(storage: S, install_key: InstallKey) -> Self {
+        Self::new_with_arc(Arc::new(storage), Arc::new(install_key))
+    }
+
+    /// Construct from an existing `Arc<S>`. Useful when the storage handle
+    /// must be shared between the controller and another consumer (e.g.,
+    /// the NC-doc renderer reads the same storage the controller writes).
+    pub fn new_with_arc(storage: Arc<S>, install_key: Arc<InstallKey>) -> Self {
         Self {
-            storage: Arc::new(storage),
-            install_key: Arc::new(install_key),
+            storage,
+            install_key,
             signing: SigningPolicy::Required,
             schema_version: CURRENT_SCHEMA_VERSION,
             chain_heads: Mutex::new(HashMap::new()),

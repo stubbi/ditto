@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use ditto_core::{
-    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, TenantId,
+    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -305,6 +305,72 @@ impl Storage for InMemoryStorage {
                 "edge {edge_id} not found"
             ))),
         }
+    }
+
+    async fn list_nodes(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Node>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<Node> = inner
+            .nodes
+            .values()
+            .filter(|n| {
+                n.tenant_id == tenant_id && scope_id.is_none_or(|s| n.scope_id == s)
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|n| n.node_id.0);
+        Ok(out)
+    }
+
+    async fn edges_from_all_time(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<Edge> = inner
+            .edges
+            .values()
+            .filter(|e| {
+                e.tenant_id == tenant_id && e.src == src && rel.is_none_or(|r| e.rel == r)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.rel
+                .cmp(&b.rel)
+                .then(a.t_valid.cmp(&b.t_valid))
+                .then(a.dst.0.cmp(&b.dst.0))
+        });
+        Ok(out)
+    }
+
+    async fn edges_to_all_time(
+        &self,
+        tenant_id: TenantId,
+        dst: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<Edge> = inner
+            .edges
+            .values()
+            .filter(|e| {
+                e.tenant_id == tenant_id && e.dst == dst && rel.is_none_or(|r| e.rel == r)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.rel
+                .cmp(&b.rel)
+                .then(a.t_valid.cmp(&b.t_valid))
+                .then(a.src.0.cmp(&b.src.0))
+        });
+        Ok(out)
     }
 }
 

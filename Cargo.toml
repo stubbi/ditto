@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ditto-core",
     "crates/ditto-memory",
+    "crates/ditto-render",
     "crates/ditto-storage-postgres",
     "crates/ditto-cli",
 ]
@@ -17,6 +18,7 @@ repository = "https://github.com/stubbi/ditto"
 [workspace.dependencies]
 ditto-core = { path = "crates/ditto-core", version = "0.0.1" }
 ditto-memory = { path = "crates/ditto-memory", version = "0.0.1" }
+ditto-render = { path = "crates/ditto-render", version = "0.0.1" }
 ditto-storage-postgres = { path = "crates/ditto-storage-postgres", version = "0.0.1" }
 
 anyhow = "1"
@@ -31,6 +33,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 thiserror = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

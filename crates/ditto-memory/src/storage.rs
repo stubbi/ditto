@@ -10,7 +10,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use ditto_core::{Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, TenantId};
+use ditto_core::{
+    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId, TenantId,
+};
 
 use crate::search::{SearchQuery, SearchResult};
 
@@ -104,4 +106,30 @@ pub trait Storage: Send + Sync {
         edge_id: EdgeId,
         t_invalid: DateTime<Utc>,
     ) -> StorageResult<()>;
+
+    /// All nodes in the tenant, optionally filtered to one scope. Used by
+    /// the NC-doc renderer to enumerate pages.
+    async fn list_nodes(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Node>>;
+
+    /// All outgoing edges from `src` (including invalidated and expired),
+    /// optionally filtered by relation. Used by the NC-doc renderer for the
+    /// historical-facts section.
+    async fn edges_from_all_time(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>>;
+
+    /// All incoming edges to `dst` (including invalidated and expired).
+    async fn edges_to_all_time(
+        &self,
+        tenant_id: TenantId,
+        dst: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>>;
 }

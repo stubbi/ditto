@@ -1,0 +1,27 @@
+[package]
+name = "ditto-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NC-doc renderer for Ditto. Projects bi-temporal NC-graph state into per-entity Markdown pages (the 'files-as-memory' slot)."
+
+[dependencies]
+ditto-core = { workspace = true }
+ditto-memory = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

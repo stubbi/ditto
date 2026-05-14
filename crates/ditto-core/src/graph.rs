@@ -17,7 +17,7 @@ use crate::error::Error;
 use crate::id::{EventId, ScopeId, TenantId};
 
 /// Logical identity for an NC-graph node. UUID. Stable across edge changes.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct NodeId(pub Uuid);
 
 impl NodeId {
@@ -47,7 +47,7 @@ impl FromStr for NodeId {
 
 /// Identity for a single edge row. Bi-temporal — multiple edges may share
 /// the same (src, rel, dst) at different valid-time windows.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct EdgeId(pub Uuid);
 
 impl EdgeId {

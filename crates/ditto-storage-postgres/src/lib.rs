@@ -485,6 +485,71 @@ impl Storage for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn list_nodes(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Node>> {
+        let rows = sqlx::query(
+            r#"SELECT node_id, tenant_id, scope_id, node_type, properties, t_created, provenance
+               FROM nc_node
+               WHERE tenant_id = $1 AND ($2::uuid IS NULL OR scope_id = $2)
+               ORDER BY node_id"#,
+        )
+        .bind(tenant_id.0)
+        .bind(scope_id.map(|s| s.0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("list_nodes: {e}")))?;
+        rows.into_iter().map(row_to_node).collect()
+    }
+
+    async fn edges_from_all_time(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let rows = sqlx::query(
+            r#"SELECT edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+               FROM nc_edge
+               WHERE tenant_id = $1 AND src = $2
+                 AND ($3::text IS NULL OR rel = $3)
+               ORDER BY rel, t_valid, dst"#,
+        )
+        .bind(tenant_id.0)
+        .bind(src.0)
+        .bind(rel)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("edges_from_all_time: {e}")))?;
+        rows.into_iter().map(row_to_edge).collect()
+    }
+
+    async fn edges_to_all_time(
+        &self,
+        tenant_id: TenantId,
+        dst: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let rows = sqlx::query(
+            r#"SELECT edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+               FROM nc_edge
+               WHERE tenant_id = $1 AND dst = $2
+                 AND ($3::text IS NULL OR rel = $3)
+               ORDER BY rel, t_valid, src"#,
+        )
+        .bind(tenant_id.0)
+        .bind(dst.0)
+        .bind(rel)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("edges_to_all_time: {e}")))?;
+        rows.into_iter().map(row_to_edge).collect()
+    }
 }
 
 fn payload_content(payload: &Value) -> String {

@@ -7,16 +7,17 @@ An agent harness with memory coherence, OS-enforced sandboxing, multi-tenant by 
 ```
 crates/
   ditto-core/             types, canonical JSON, content addressing, Ed25519 signing
-  ditto-memory/           MemoryController + Storage trait + InMemoryStorage reference
-  ditto-storage-postgres/ Postgres backend (sqlx + tsvector BM25; pgvector + KG to come)
-  ditto-cli/              `ditto migrate / write / search / keygen`
+  ditto-memory/           MemoryController + Storage trait + bi-temporal NC-graph
+  ditto-render/           NC-doc renderer (bi-temporal Markdown pages from the graph)
+  ditto-storage-postgres/ Postgres backend (sqlx + tsvector BM25 + nc_node + nc_edge)
+  ditto-cli/              `ditto migrate / write / search / keygen / render`
 migrations/
   initial_schema.sql      episodic + receipt tables
 eval/
   ditto-eval Python package — see eval/README.md
 ```
 
-32 tests green (canonical JSON determinism, content addressing, Ed25519 sign/verify, hash chain, signed receipts, idempotent writes, in-memory search, bi-temporal edge supersession, time-travel queries, retroactive invalidation). Cross-language interop check: `EventId` computed in Rust matches `content_address` in the Python eval harness for the same payload bit-for-bit.
+40 tests green (canonical JSON determinism, content addressing, Ed25519 sign/verify, hash chain, signed receipts, idempotent writes, in-memory search, bi-temporal edge supersession, time-travel queries, retroactive invalidation, deterministic NC-doc render, idempotent re-render, historical-facts section, manifest content hashing, removal cascade). Cross-language interop check: `EventId` computed in Rust matches `content_address` in the Python eval harness for the same payload bit-for-bit.
 
 ```bash
 cargo build && cargo test                 # 25/25 pass

@@ -11,7 +11,9 @@
 //! persistence — exists for smoke testing without a database).
 
 use std::env;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -19,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 use ditto_core::{InstallKey, ScopeId, Slot, TenantId};
 use ditto_memory::{InMemoryStorage, MemoryController, SearchMode, SearchQuery, Storage};
+use ditto_render::{LocalFilesystem, RenderJob};
 use ditto_storage_postgres::PostgresStorage;
 
 #[derive(Parser, Debug)]
@@ -69,6 +72,17 @@ enum Cmd {
     },
     /// Print a fresh 32-byte Ed25519 install secret (hex).
     Keygen,
+    /// Render NC-graph state to NC-doc Markdown pages on disk.
+    Render {
+        #[arg(long)]
+        tenant: String,
+        /// Restrict to one scope. If omitted, all scopes for the tenant.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output directory. Will be created if missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -109,20 +123,24 @@ async fn main() -> Result<()> {
             anyhow::bail!("migrate requires --database-url or DATABASE_URL")
         }
         (cmd, Some(url)) => {
-            let storage = PostgresStorage::connect(&url).await?;
-            let ctrl = MemoryController::new(storage, install_key);
-            run_cmd(cmd, &ctrl).await
+            let storage = Arc::new(PostgresStorage::connect(&url).await?);
+            let ctrl = MemoryController::new_with_arc(storage.clone(), Arc::new(install_key));
+            run_cmd(cmd, ctrl, storage).await
         }
         (cmd, None) => {
-            let storage = InMemoryStorage::new();
-            let ctrl = MemoryController::new(storage, install_key);
+            let storage = Arc::new(InMemoryStorage::new());
+            let ctrl = MemoryController::new_with_arc(storage.clone(), Arc::new(install_key));
             tracing::warn!("no database URL — using ephemeral in-memory backend");
-            run_cmd(cmd, &ctrl).await
+            run_cmd(cmd, ctrl, storage).await
         }
     }
 }
 
-async fn run_cmd<S: Storage>(cmd: Cmd, ctrl: &MemoryController<S>) -> Result<()> {
+async fn run_cmd<S: Storage + 'static>(
+    cmd: Cmd,
+    ctrl: MemoryController<S>,
+    storage: Arc<S>,
+) -> Result<()> {
     match cmd {
         Cmd::Migrate | Cmd::Keygen => unreachable!(),
         Cmd::Write {
@@ -154,6 +172,21 @@ async fn run_cmd<S: Storage>(cmd: Cmd, ctrl: &MemoryController<S>) -> Result<()>
             q.mode = parse_mode(&mode)?;
             let results = ctrl.search(&q).await?;
             println!("{}", serde_json::to_string_pretty(&results)?);
+            Ok(())
+        }
+        Cmd::Render { tenant, scope, out } => {
+            let tenant_id = TenantId::from_str(&tenant)?;
+            let scope_id = scope.as_deref().map(ScopeId::from_str).transpose()?;
+            let fs = Arc::new(LocalFilesystem::new(out.clone()));
+            let job = RenderJob::new(storage, fs);
+            let report = job.render(tenant_id, scope_id).await?;
+            println!(
+                "rendered: written={} unchanged={} removed={} into {}",
+                report.pages_written,
+                report.pages_unchanged,
+                report.pages_removed,
+                out.display()
+            );
             Ok(())
         }
     }
