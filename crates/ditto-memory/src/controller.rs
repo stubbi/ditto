@@ -261,7 +261,11 @@ impl<S: Storage> MemoryController<S> {
             dream_extract_concurrency: 8,
             long_sleep_decay: 0.95,
             reranker: None,
-            rerank_pool_factor: 3,
+            // 5× over-retrieval feeds the reranker a deeper candidate
+            // pool. Single-hop LoCoMo evidence frequently lands at
+            // rank 30-50 because the speaker-name surface tokens
+            // dominate BM25/cosine at the top of the pool.
+            rerank_pool_factor: 5,
         }
     }
 

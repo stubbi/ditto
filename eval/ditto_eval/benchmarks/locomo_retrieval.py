@@ -22,6 +22,8 @@ import json
 import re
 from pathlib import Path
 
+import os
+
 from ditto_eval.backends.base import MemoryBackend
 from ditto_eval.benchmarks.base import Benchmark, BenchmarkResult, ExampleResult
 from ditto_eval.benchmarks.locomo import (
@@ -31,6 +33,8 @@ from ditto_eval.benchmarks.locomo import (
     fetch_dataset,
     parse_session_datetime,
 )
+from ditto_eval.llm import LlmClient
+from ditto_eval.query_expansion import expand_query
 from ditto_eval.types import Event
 
 
@@ -52,6 +56,14 @@ class LocomoRetrievalBench(Benchmark):
             if self.config.conversations is None
             else self.config.conversations
         )
+
+        # Query expansion is opt-in via env. We allocate one LlmClient
+        # for the bench when enabled — single connection pool, reused
+        # across all questions.
+        qe_enabled = os.environ.get("LOCOMO_QUERY_EXPANSION", "0").lower() in ("1", "true", "yes")
+        qe_llm: LlmClient | None = None
+        if qe_enabled:
+            qe_llm = LlmClient()
 
         examples: list[ExampleResult] = []
         by_category: dict[str, list[float]] = {v: [] for v in CATEGORY_NAMES.values()}
@@ -104,7 +116,7 @@ class LocomoRetrievalBench(Benchmark):
 
             async def one(q: dict, conv_id: str = tenant_id) -> ExampleResult:
                 async with sem:
-                    return await self._one(backend, conv_id, q, dia_to_event)
+                    return await self._one(backend, conv_id, q, dia_to_event, qe_llm)
 
             conv_results = await asyncio.gather(*[one(q) for q in qa])
             for r in conv_results:
@@ -117,6 +129,8 @@ class LocomoRetrievalBench(Benchmark):
                 if r.details.get("recall_at_10", 0.0) > 0:
                     recall10_hits += 1
             await backend.reset(tenant_id)
+        if qe_llm is not None:
+            await qe_llm.close()
 
         total = len(examples)
         per_cat = {
@@ -147,6 +161,7 @@ class LocomoRetrievalBench(Benchmark):
         tenant_id: str,
         q: dict,
         dia_to_event: dict[str, str],
+        qe_llm: LlmClient | None = None,
     ) -> ExampleResult:
         question = q["question"]
         category = CATEGORY_NAMES.get(q["category"], "unknown")
@@ -165,11 +180,33 @@ class LocomoRetrievalBench(Benchmark):
                 details={"category": category, "skipped_no_evidence": True},
             )
 
-        results = await backend.search(
-            query=question,
-            tenant_id=tenant_id,
-            k=max(self.config.top_k, 10),
-        )
+        # Query expansion: search each phrasing, union the results,
+        # keep best-rank for each event_id across the union.
+        if qe_llm is not None:
+            variants = await expand_query(qe_llm, question)
+        else:
+            variants = [question]
+
+        # Per-variant search, merge by lowest rank (best score wins).
+        from collections import defaultdict
+        best_rank: dict[str, int] = defaultdict(lambda: 10**9)
+        any_results: list = []
+        for v in variants:
+            res = await backend.search(
+                query=v,
+                tenant_id=tenant_id,
+                k=max(self.config.top_k, 10),
+            )
+            for i, r in enumerate(res):
+                if i < best_rank[r.event_id]:
+                    best_rank[r.event_id] = i
+                if not any_results or all(
+                    ar.event_id != r.event_id for ar in any_results
+                ):
+                    any_results.append(r)
+        # Order results by best rank-across-variants ascending.
+        any_results.sort(key=lambda r: best_rank[r.event_id])
+        results = any_results
         retrieved_ids = [r.event_id for r in results]
         top5 = set(retrieved_ids[:5])
         top10 = set(retrieved_ids[:10])
