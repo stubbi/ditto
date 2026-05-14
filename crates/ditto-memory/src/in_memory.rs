@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewSkill, Node, NodeId,
-    Receipt, ScopeId, Skill, SkillId, SkillStatus, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill, Node,
+    NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId, SkillStatus, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -46,6 +46,8 @@ struct Inner {
     blobs: HashMap<(TenantId, BlobHash), Blob>,
     /// (tenant_id, skill_id) -> Skill. Procedural index.
     skills: HashMap<(TenantId, SkillId), Skill>,
+    /// reflective_id -> Reflective (versioned via bi-temporal cols).
+    reflective: HashMap<ReflectiveId, Reflective>,
 }
 
 impl InMemoryStorage {
@@ -142,6 +144,7 @@ impl Storage for InMemoryStorage {
         inner.edges.retain(|_, e| e.tenant_id != tenant_id);
         inner.blobs.retain(|(t, _), _| *t != tenant_id);
         inner.skills.retain(|(t, _), _| *t != tenant_id);
+        inner.reflective.retain(|_, r| r.tenant_id != tenant_id);
         Ok(())
     }
 
@@ -498,6 +501,103 @@ impl Storage for InMemoryStorage {
             .get_mut(&(tenant_id, skill_id.clone()))
             .ok_or_else(|| StorageError::Other(format!("skill not found: {skill_id}")))?;
         skill.status = status;
+        Ok(())
+    }
+
+    async fn insert_reflective(&self, new: NewReflective) -> StorageResult<Reflective> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.reflective.contains_key(&new.reflective_id) {
+            return Err(StorageError::Other(format!(
+                "reflective {} already exists",
+                new.reflective_id
+            )));
+        }
+        let record = Reflective {
+            reflective_id: new.reflective_id,
+            tenant_id: new.tenant_id,
+            scope_id: new.scope_id,
+            content: new.content,
+            confidence: new.confidence.clamp(0.0, 1.0),
+            source_event_ids: new.source_event_ids,
+            consolidation_receipt: new.consolidation_receipt,
+            t_created: Utc::now(),
+            t_expired: None,
+            t_valid: new.t_valid,
+            t_invalid: None,
+        };
+        inner
+            .reflective
+            .insert(new.reflective_id, record.clone());
+        Ok(record)
+    }
+
+    async fn get_reflective(
+        &self,
+        tenant_id: TenantId,
+        reflective_id: ReflectiveId,
+    ) -> StorageResult<Option<Reflective>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .reflective
+            .get(&reflective_id)
+            .filter(|r| r.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    async fn current_reflective(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<Reflective> = inner
+            .reflective
+            .values()
+            .filter(|r| {
+                r.tenant_id == tenant_id
+                    && r.t_expired.is_none()
+                    && r.t_invalid.is_none()
+                    && scope_id.is_none_or(|s| r.scope_id == s)
+            })
+            .cloned()
+            .collect();
+        // Deterministic order: most-recently-valid first, then id for ties.
+        out.sort_by(|a, b| b.t_valid.cmp(&a.t_valid).then(a.reflective_id.0.cmp(&b.reflective_id.0)));
+        Ok(out)
+    }
+
+    async fn list_reflective_all_time(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<Reflective> = inner
+            .reflective
+            .values()
+            .filter(|r| r.tenant_id == tenant_id && scope_id.is_none_or(|s| r.scope_id == s))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.t_valid.cmp(&b.t_valid).then(a.reflective_id.0.cmp(&b.reflective_id.0)));
+        Ok(out)
+    }
+
+    async fn invalidate_reflective(
+        &self,
+        reflective_id: ReflectiveId,
+        t_invalid: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let r = inner
+            .reflective
+            .get_mut(&reflective_id)
+            .ok_or_else(|| StorageError::Other(format!("reflective not found: {reflective_id}")))?;
+        if let Some(existing) = r.t_invalid {
+            if existing == t_invalid {
+                return Ok(());
+            }
+        }
+        r.t_invalid = Some(t_invalid);
         Ok(())
     }
 }

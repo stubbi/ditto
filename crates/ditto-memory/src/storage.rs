@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewSkill, Node, NodeId,
-    Receipt, ScopeId, Skill, SkillId, SkillStatus, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill, Node,
+    NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId, SkillStatus, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -200,5 +200,41 @@ pub trait Storage: Send + Sync {
         tenant_id: TenantId,
         skill_id: &SkillId,
         status: SkillStatus,
+    ) -> StorageResult<()>;
+
+    // --- Reflective ---
+
+    /// Insert a reflection. Errors if `reflective_id` already exists.
+    /// `t_created` is set by the backend at insert time. Caller may set
+    /// `t_valid` to a past timestamp (when this insight became true).
+    async fn insert_reflective(&self, new: NewReflective) -> StorageResult<Reflective>;
+
+    async fn get_reflective(
+        &self,
+        tenant_id: TenantId,
+        reflective_id: ReflectiveId,
+    ) -> StorageResult<Option<Reflective>>;
+
+    /// Current reflections — `t_expired IS NULL AND t_invalid IS NULL`.
+    /// Filtered to one scope if `scope_id` is `Some`.
+    async fn current_reflective(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>>;
+
+    /// All reflections regardless of bi-temporal state. Used by the NC-doc
+    /// renderer for the historical-reflections section and by export.
+    async fn list_reflective_all_time(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>>;
+
+    /// Set `t_invalid` on a reflection. Idempotent on equal values.
+    async fn invalidate_reflective(
+        &self,
+        reflective_id: ReflectiveId,
+        t_invalid: DateTime<Utc>,
     ) -> StorageResult<()>;
 }

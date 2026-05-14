@@ -21,9 +21,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, NewSkill, Node,
-    NodeId, Receipt, ScopeId, SchemaVersion, Skill, SkillId, SkillStatus, Slot, TenantId,
-    CURRENT_SCHEMA_VERSION,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, NewReflective,
+    NewSkill, Node, NodeId, Receipt, Reflective, ReflectiveId, ScopeId, SchemaVersion, Skill,
+    SkillId, SkillStatus, Slot, TenantId, CURRENT_SCHEMA_VERSION,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -261,6 +261,48 @@ impl<S: Storage> MemoryController<S> {
     ) -> StorageResult<()> {
         self.storage
             .set_skill_status(tenant_id, skill_id, status)
+            .await
+    }
+
+    // --- Reflective ---
+
+    pub async fn write_reflection(&self, new: NewReflective) -> StorageResult<Reflective> {
+        self.storage.insert_reflective(new).await
+    }
+
+    pub async fn get_reflection(
+        &self,
+        tenant_id: TenantId,
+        reflective_id: ReflectiveId,
+    ) -> StorageResult<Option<Reflective>> {
+        self.storage.get_reflective(tenant_id, reflective_id).await
+    }
+
+    pub async fn current_reflections(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>> {
+        self.storage.current_reflective(tenant_id, scope_id).await
+    }
+
+    pub async fn reflections_all_time(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>> {
+        self.storage
+            .list_reflective_all_time(tenant_id, scope_id)
+            .await
+    }
+
+    pub async fn invalidate_reflection(
+        &self,
+        reflective_id: ReflectiveId,
+        t_invalid: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        self.storage
+            .invalidate_reflective(reflective_id, t_invalid)
             .await
     }
 }
@@ -967,5 +1009,142 @@ mod tests {
         let b_list = ctrl.list_skills(t_b, None).await.unwrap();
         assert_eq!(a_list.len(), 1);
         assert_eq!(b_list.len(), 1);
+    }
+
+    // --- Reflective ---
+
+    fn new_reflection(
+        tenant: TenantId,
+        scope: ScopeId,
+        content: &str,
+        t_valid: DateTime<Utc>,
+    ) -> NewReflective {
+        NewReflective {
+            reflective_id: ReflectiveId::new(),
+            tenant_id: tenant,
+            scope_id: scope,
+            content: content.into(),
+            confidence: 0.8,
+            source_event_ids: vec![],
+            consolidation_receipt: None,
+            t_valid,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_reflection_round_trips() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write_reflection(new_reflection(
+                tenant,
+                scope,
+                "user prefers terse responses",
+                t(2026, 5, 14),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "user prefers terse responses");
+        assert!(r.t_invalid.is_none());
+        let got = ctrl
+            .get_reflection(tenant, r.reflective_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.content, r.content);
+    }
+
+    #[tokio::test]
+    async fn current_reflections_excludes_invalidated() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r1 = ctrl
+            .write_reflection(new_reflection(tenant, scope, "alpha", t(2026, 5, 1)))
+            .await
+            .unwrap();
+        let _r2 = ctrl
+            .write_reflection(new_reflection(tenant, scope, "beta", t(2026, 5, 2)))
+            .await
+            .unwrap();
+        ctrl.invalidate_reflection(r1.reflective_id, t(2026, 5, 14))
+            .await
+            .unwrap();
+        let current = ctrl.current_reflections(tenant, None).await.unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].content, "beta");
+        // But all_time still sees both.
+        let all = ctrl.reflections_all_time(tenant, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn current_reflections_sorted_most_recent_first() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let _a = ctrl
+            .write_reflection(new_reflection(tenant, scope, "older", t(2026, 5, 1)))
+            .await
+            .unwrap();
+        let _b = ctrl
+            .write_reflection(new_reflection(tenant, scope, "newer", t(2026, 5, 14)))
+            .await
+            .unwrap();
+        let current = ctrl.current_reflections(tenant, None).await.unwrap();
+        assert_eq!(current[0].content, "newer");
+        assert_eq!(current[1].content, "older");
+    }
+
+    #[tokio::test]
+    async fn reflection_confidence_clamped_to_range() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let mut nr = new_reflection(tenant, scope, "out-of-range", t(2026, 5, 14));
+        nr.confidence = 2.5;
+        let r = ctrl.write_reflection(nr).await.unwrap();
+        assert!((r.confidence - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn invalidate_is_idempotent_on_equal_value() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write_reflection(new_reflection(tenant, scope, "x", t(2026, 5, 14)))
+            .await
+            .unwrap();
+        ctrl.invalidate_reflection(r.reflective_id, t(2026, 5, 14))
+            .await
+            .unwrap();
+        // Second call with same t_invalid must succeed (no error).
+        ctrl.invalidate_reflection(r.reflective_id, t(2026, 5, 14))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reflections_are_tenant_scoped() {
+        let ctrl = ctrl();
+        let t_a = TenantId::new();
+        let t_b = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write_reflection(new_reflection(t_a, scope, "tenant-a's belief", t(2026, 5, 14)))
+            .await
+            .unwrap();
+        // Wrong-tenant get returns None even with the right id.
+        assert!(ctrl
+            .get_reflection(t_b, r.reflective_id)
+            .await
+            .unwrap()
+            .is_none());
+        let a_current = ctrl.current_reflections(t_a, None).await.unwrap();
+        let b_current = ctrl.current_reflections(t_b, None).await.unwrap();
+        assert_eq!(a_current.len(), 1);
+        assert_eq!(b_current.len(), 0);
     }
 }

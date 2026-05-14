@@ -16,9 +16,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewSkill, Node, NodeId,
-    Receipt, ScopeId, SchemaVersion, Signature, Skill, SkillId, SkillStatus, Slot, SupersedePolicy,
-    TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewReflective, NewSkill, Node,
+    NodeId, Receipt, Reflective, ReflectiveId, ScopeId, SchemaVersion, Signature, Skill, SkillId,
+    SkillStatus, Slot, SupersedePolicy, TenantId,
 };
 use ditto_memory::search::{SearchQuery, SearchResult};
 use ditto_memory::storage::{Storage, StorageError, StorageResult};
@@ -253,6 +253,11 @@ impl Storage for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Other(format!("reset procedural: {e}")))?;
+        sqlx::query("DELETE FROM reflective WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset reflective: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| StorageError::Other(format!("reset commit: {e}")))?;
@@ -785,6 +790,127 @@ impl Storage for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn insert_reflective(&self, new: NewReflective) -> StorageResult<Reflective> {
+        let source_bytes: Vec<&[u8]> = new
+            .source_event_ids
+            .iter()
+            .map(|e| e.0.as_slice())
+            .collect();
+        let consolidation = new.consolidation_receipt.map(|e| e.0.to_vec());
+        let row = sqlx::query(
+            r#"INSERT INTO reflective
+                 (reflective_id, tenant_id, scope_id, content, confidence,
+                  source_event_ids, consolidation_receipt, t_valid)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING reflective_id, tenant_id, scope_id, content, confidence,
+                         source_event_ids, consolidation_receipt,
+                         t_created, t_expired, t_valid, t_invalid"#,
+        )
+        .bind(new.reflective_id.0)
+        .bind(new.tenant_id.0)
+        .bind(new.scope_id.0)
+        .bind(&new.content)
+        .bind(new.confidence.clamp(0.0, 1.0))
+        .bind(&source_bytes)
+        .bind(consolidation.as_deref())
+        .bind(new.t_valid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("insert_reflective: {e}")))?;
+        row_to_reflective(row)
+    }
+
+    async fn get_reflective(
+        &self,
+        tenant_id: TenantId,
+        reflective_id: ReflectiveId,
+    ) -> StorageResult<Option<Reflective>> {
+        let row = sqlx::query(
+            r#"SELECT reflective_id, tenant_id, scope_id, content, confidence,
+                      source_event_ids, consolidation_receipt,
+                      t_created, t_expired, t_valid, t_invalid
+               FROM reflective
+               WHERE tenant_id = $1 AND reflective_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(reflective_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("get_reflective: {e}")))?;
+        row.map(row_to_reflective).transpose()
+    }
+
+    async fn current_reflective(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>> {
+        let rows = sqlx::query(
+            r#"SELECT reflective_id, tenant_id, scope_id, content, confidence,
+                      source_event_ids, consolidation_receipt,
+                      t_created, t_expired, t_valid, t_invalid
+               FROM reflective
+               WHERE tenant_id = $1
+                 AND t_expired IS NULL AND t_invalid IS NULL
+                 AND ($2::uuid IS NULL OR scope_id = $2)
+               ORDER BY t_valid DESC, reflective_id"#,
+        )
+        .bind(tenant_id.0)
+        .bind(scope_id.map(|s| s.0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("current_reflective: {e}")))?;
+        rows.into_iter().map(row_to_reflective).collect()
+    }
+
+    async fn list_reflective_all_time(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+    ) -> StorageResult<Vec<Reflective>> {
+        let rows = sqlx::query(
+            r#"SELECT reflective_id, tenant_id, scope_id, content, confidence,
+                      source_event_ids, consolidation_receipt,
+                      t_created, t_expired, t_valid, t_invalid
+               FROM reflective
+               WHERE tenant_id = $1
+                 AND ($2::uuid IS NULL OR scope_id = $2)
+               ORDER BY t_valid, reflective_id"#,
+        )
+        .bind(tenant_id.0)
+        .bind(scope_id.map(|s| s.0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("list_reflective_all_time: {e}")))?;
+        rows.into_iter().map(row_to_reflective).collect()
+    }
+
+    async fn invalidate_reflective(
+        &self,
+        reflective_id: ReflectiveId,
+        t_invalid: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        // Idempotent on equal t_invalid: a second call with the same value
+        // is a no-op rather than a conflict. Mirrors invalidate_edge.
+        let n = sqlx::query(
+            r#"UPDATE reflective
+               SET t_invalid = $2
+               WHERE reflective_id = $1
+                 AND (t_invalid IS NULL OR t_invalid = $2)"#,
+        )
+        .bind(reflective_id.0)
+        .bind(t_invalid)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("invalidate_reflective: {e}")))?;
+        if n.rows_affected() == 0 {
+            return Err(StorageError::Other(format!(
+                "reflective not found or already invalidated at a different time: {reflective_id}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn payload_content(payload: &Value) -> String {
@@ -1029,5 +1155,63 @@ fn row_to_skill(tenant_id: TenantId, row: sqlx::postgres::PgRow) -> StorageResul
         last_used,
         tests_pass,
         status,
+    })
+}
+
+fn row_to_reflective(row: sqlx::postgres::PgRow) -> StorageResult<Reflective> {
+    let reflective_id: uuid::Uuid = row
+        .try_get("reflective_id")
+        .map_err(|e| StorageError::Other(format!("reflective_id col: {e}")))?;
+    let tenant_id: uuid::Uuid = row
+        .try_get("tenant_id")
+        .map_err(|e| StorageError::Other(format!("tenant_id col: {e}")))?;
+    let scope_id: uuid::Uuid = row
+        .try_get("scope_id")
+        .map_err(|e| StorageError::Other(format!("scope_id col: {e}")))?;
+    let content: String = row
+        .try_get("content")
+        .map_err(|e| StorageError::Other(format!("content col: {e}")))?;
+    let confidence: f32 = row
+        .try_get("confidence")
+        .map_err(|e| StorageError::Other(format!("confidence col: {e}")))?;
+    let source_bytes: Vec<Vec<u8>> = row
+        .try_get("source_event_ids")
+        .map_err(|e| StorageError::Other(format!("source_event_ids col: {e}")))?;
+    let source_event_ids: Vec<EventId> = source_bytes
+        .into_iter()
+        .map(|b| EventId::from_hex(&hex_lower(&b)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StorageError::Other(format!("source_event_ids decode: {e}")))?;
+    let cons_bytes: Option<Vec<u8>> = row
+        .try_get("consolidation_receipt")
+        .map_err(|e| StorageError::Other(format!("consolidation_receipt col: {e}")))?;
+    let consolidation_receipt = cons_bytes
+        .map(|b| EventId::from_hex(&hex_lower(&b)))
+        .transpose()
+        .map_err(|e| StorageError::Other(format!("consolidation_receipt decode: {e}")))?;
+    let t_created: DateTime<Utc> = row
+        .try_get("t_created")
+        .map_err(|e| StorageError::Other(format!("t_created col: {e}")))?;
+    let t_expired: Option<DateTime<Utc>> = row
+        .try_get("t_expired")
+        .map_err(|e| StorageError::Other(format!("t_expired col: {e}")))?;
+    let t_valid: DateTime<Utc> = row
+        .try_get("t_valid")
+        .map_err(|e| StorageError::Other(format!("t_valid col: {e}")))?;
+    let t_invalid: Option<DateTime<Utc>> = row
+        .try_get("t_invalid")
+        .map_err(|e| StorageError::Other(format!("t_invalid col: {e}")))?;
+    Ok(Reflective {
+        reflective_id: ReflectiveId(reflective_id),
+        tenant_id: TenantId(tenant_id),
+        scope_id: ScopeId(scope_id),
+        content,
+        confidence,
+        source_event_ids,
+        consolidation_receipt,
+        t_created,
+        t_expired,
+        t_valid,
+        t_invalid,
     })
 }
