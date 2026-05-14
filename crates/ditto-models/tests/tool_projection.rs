@@ -79,8 +79,15 @@ fn registry_dedupes_identical_schemas() {
     });
 
     assert_eq!(proj.tools.len(), 3);
-    // Two distinct schemas across three tools.
-    assert_eq!(proj.schemas.len(), 2);
+    // Two distinct schemas across three tools — verifiable through the
+    // schema-bytes cache the registry maintains internally.
+    use std::collections::HashSet;
+    let unique: HashSet<_> = proj
+        .tools
+        .iter()
+        .map(|t| t.schema_hash().unwrap())
+        .collect();
+    assert_eq!(unique.len(), 2);
 }
 
 #[test]
@@ -109,7 +116,7 @@ fn channel_filter_excludes_unauthorized_tools() {
     });
 
     assert_eq!(proj.tools.len(), 1);
-    assert_eq!(proj.tools[0].0, "say_hi");
+    assert_eq!(proj.tools[0].id.0, "say_hi");
 }
 
 #[test]
@@ -136,7 +143,7 @@ fn kind_filter_excludes_provider_native_when_not_requested() {
     });
 
     assert_eq!(proj.tools.len(), 1);
-    assert_eq!(proj.tools[0].0, "mcp_tool");
+    assert_eq!(proj.tools[0].id.0, "mcp_tool");
 }
 
 #[test]

@@ -2,7 +2,7 @@ use crate::capabilities::CapabilitySet;
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Stable identifier for a tool. Matches the MCP server's tool name when the
@@ -93,13 +93,13 @@ pub enum ProjectionMode {
     CodeExecution { entrypoint_module: String },
 }
 
-/// Result of projecting a registry against a turn. Holds deduped schemas in a
-/// `BTreeMap` so the wire serialization is deterministic.
+/// Result of projecting a registry against a turn. Holds resolved tools so an
+/// adapter can serialize them directly into the provider's wire shape without
+/// a second lookup through the registry.
 #[derive(Clone, Debug, Default)]
 pub struct Projected {
     pub mode: Option<ProjectionMode>,
-    pub tools: Vec<ToolId>,
-    pub schemas: BTreeMap<SchemaHash, Arc<Vec<u8>>>,
+    pub tools: Vec<Arc<Tool>>,
 }
 
 #[derive(Default)]
@@ -142,9 +142,6 @@ impl ToolRegistry {
     /// `select_mode` so it's testable in isolation; callers can also force a
     /// mode through `TurnProjection::mode`.
     pub fn project(&self, turn: TurnProjection<'_>) -> Projected {
-        let mut tools = Vec::new();
-        let mut schemas: BTreeMap<SchemaHash, Arc<Vec<u8>>> = BTreeMap::new();
-
         let mut candidates: Vec<&Arc<Tool>> = self
             .by_id
             .values()
@@ -156,18 +153,15 @@ impl ToolRegistry {
             .collect();
         candidates.sort_by(|a, b| a.id.cmp(&b.id));
 
-        for tool in candidates {
-            let Ok(hash) = tool.schema_hash() else { continue };
-            tools.push(tool.id.clone());
-            if let Some(bytes) = self.schema_cache.get(&hash) {
-                schemas.entry(hash).or_insert_with(|| bytes.clone());
-            }
-        }
-
         Projected {
             mode: Some(turn.mode),
-            tools,
-            schemas,
+            tools: candidates.into_iter().cloned().collect(),
         }
+    }
+
+    /// Look up the canonical-JSON bytes for a tool's schema. Useful for
+    /// adapters that compute on-the-wire token budgets before sending.
+    pub fn schema_bytes(&self, hash: SchemaHash) -> Option<&Arc<Vec<u8>>> {
+        self.schema_cache.get(&hash)
     }
 }

@@ -5,6 +5,8 @@ use crate::stream::EventStream;
 use crate::Error;
 use async_trait::async_trait;
 
+pub mod openrouter;
+
 /// The Provider contract.
 ///
 /// `Capabilities` is an associated type rather than `Box<dyn CapabilitySet>` so

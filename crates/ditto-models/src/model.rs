@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ProviderId(pub String);
@@ -64,7 +65,10 @@ pub enum Region {
 pub struct Call<Ext = ()> {
     pub model: ModelRef,
     pub messages: Vec<Message>,
-    pub tools: Vec<crate::tools::ToolId>,
+    /// Tools available this turn — already projected against the channel/role
+    /// allow-list. Adapters serialize these into provider-specific shapes
+    /// (OpenAI's `tools` array, Anthropic's `tools` field, etc.).
+    pub tools: Vec<Arc<crate::tools::Tool>>,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stop: Vec<String>,
