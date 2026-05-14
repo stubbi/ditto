@@ -183,6 +183,13 @@ pub struct MemoryController<S: Storage> {
     /// pathologies where the relative gate alone would happily keep
     /// every record clustered around 0.4. 0.0 disables.
     min_absolute_cosine: f32,
+    /// Recency-blend weight in [0.0, 1.0]. The final ranking score becomes
+    /// `(1 - α) * relevance + α * recency_factor`, where `recency_factor`
+    /// is the result's relative rank by timestamp inside the candidate
+    /// set (1.0 = newest, 0.0 = oldest). 0.0 disables recency entirely
+    /// (default — the architecture intends this to be learned per-tenant,
+    /// not picked once and forgotten).
+    alpha_recency: f32,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -218,6 +225,12 @@ impl<S: Storage> MemoryController<S> {
             // bench when adding fixtures.
             min_relative_score: 0.5,
             min_absolute_cosine: 0.35,
+            // Recency off by default. Provenance-Bench's two cases pull in
+            // opposite directions (prov-001 wants oldest-correct, prov-002
+            // wants newest-correct), so any fixed positive value here
+            // trades fail-modes. The architecturally honest path to prov-002
+            // is NC-graph bi-temporal supersession in the dream cycle.
+            alpha_recency: 0.0,
         }
     }
 
@@ -243,6 +256,17 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn min_absolute_cosine(&self) -> f32 {
         self.min_absolute_cosine
+    }
+
+    /// Recency-blend weight (α_recency). `0.0` = recency ignored;
+    /// `1.0` = score is pure recency. Default 0.0.
+    pub fn with_alpha_recency(mut self, alpha: f32) -> Self {
+        self.alpha_recency = alpha.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn alpha_recency(&self) -> f32 {
+        self.alpha_recency
     }
 
     pub fn with_labile_window(mut self, duration: Duration) -> Self {
@@ -368,7 +392,7 @@ impl<S: Storage> MemoryController<S> {
     pub async fn search(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
         let raw = self.run_retrieval(query).await?;
         let resolved = self.resolve_shadows(query.tenant_id, raw).await?;
-        let gated = self.apply_relevance_gate(resolved);
+        let gated = self.apply_recency_blend(self.apply_relevance_gate(resolved));
 
         // Open the labile window on every returned event.
         let now = Utc::now();
@@ -392,6 +416,60 @@ impl<S: Storage> MemoryController<S> {
     /// (compressed; less effective, but better than nothing).
     ///
     /// Disabled entirely when `min_relative_score == 0.0`.
+    /// Blend recency into the final ranking. Each result's blended score is
+    /// `(1 - α) * (score / top_score) + α * recency_factor`, where
+    /// `recency_factor` is the result's rank-by-timestamp within the
+    /// candidate set (1.0 = newest, 0.0 = oldest). α = 0 is the identity.
+    fn apply_recency_blend(&self, mut results: Vec<SearchResult>) -> Vec<SearchResult> {
+        let alpha = self.alpha_recency as f64;
+        if alpha <= 0.0 || results.len() < 2 {
+            return results;
+        }
+        // Pull timestamps out of metadata (RFC3339 string format set by
+        // the storage layer's `timestamp` field).
+        let mut tss: Vec<Option<DateTime<Utc>>> = results
+            .iter()
+            .map(|r| {
+                r.metadata
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&Utc))
+            })
+            .collect();
+        // If any timestamp is missing we abstain — partial recency would
+        // be worse than none.
+        if tss.iter().any(|t| t.is_none()) {
+            // Fall back to relevance-only order.
+            return results;
+        }
+        let min_ts = tss.iter().filter_map(|t| t.as_ref()).min().copied().unwrap();
+        let max_ts = tss.iter().filter_map(|t| t.as_ref()).max().copied().unwrap();
+        let span = (max_ts - min_ts).num_seconds().max(1) as f64;
+
+        let top_score = results
+            .iter()
+            .map(|r| r.score)
+            .fold(f32::NEG_INFINITY, f32::max) as f64;
+        if top_score <= 0.0 {
+            return results;
+        }
+
+        for (i, r) in results.iter_mut().enumerate() {
+            let ts = tss[i].take().unwrap();
+            let rec = ((ts - min_ts).num_seconds() as f64) / span;
+            let rel = (r.score as f64) / top_score;
+            r.score = ((1.0 - alpha) * rel + alpha * rec) as f32;
+        }
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.event_id.0.cmp(&b.event_id.0))
+        });
+        results
+    }
+
     fn apply_relevance_gate(&self, results: Vec<SearchResult>) -> Vec<SearchResult> {
         let relative_active = self.min_relative_score > 0.0;
         let absolute_active = self.min_absolute_cosine > 0.0;
@@ -655,7 +733,7 @@ impl<S: Storage> MemoryController<S> {
         let mut top = fused.clone();
         top.truncate(query.k);
         let pre_gate = self.resolve_shadows(query.tenant_id, top).await?;
-        let resolved = self.apply_relevance_gate(pre_gate);
+        let resolved = self.apply_recency_blend(self.apply_relevance_gate(pre_gate));
         let now = Utc::now();
         let until = now + self.labile_window;
         {
@@ -2380,6 +2458,97 @@ mod tests {
         // results = just the relevant one; rejected = the unrelated chatter.
         assert_eq!(exp.results.len(), 1);
         assert!(!exp.rejected_candidates.is_empty());
+    }
+
+    // --- α_recency blending ---
+
+    #[tokio::test]
+    async fn alpha_recency_zero_preserves_relevance_order() {
+        // Default alpha_recency = 0.0. Order matches relevance ranking
+        // regardless of timestamps. We use distinct payloads (same query
+        // hits, different content) since identical payloads would collide
+        // on the content-addressed event_id PK.
+        let ctrl = ctrl_with_embedder()
+            .with_min_relative_score(0.0)
+            .with_min_absolute_cosine(0.0);
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        // "alpha one" comes first temporally; "alpha two" much later.
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha one"}),
+            t(2026, 1, 1),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha two"}),
+            t(2026, 5, 14),
+        )
+        .await
+        .unwrap();
+        // α=0 → relevance-only order. The hash-projection embedder treats
+        // the two as having identical bag-of-tokens overlap with "alpha";
+        // RRF then tiebreaks by event_id, so order is deterministic but
+        // not necessarily newest-first. The invariant we care about is
+        // that BOTH are returned.
+        let hits = ctrl
+            .search(&SearchQuery::new("alpha", tenant))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn alpha_recency_one_reorders_by_timestamp() {
+        let ctrl = ctrl_with_embedder()
+            .with_alpha_recency(1.0)
+            .with_min_relative_score(0.0)
+            .with_min_absolute_cosine(0.0);
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha one"}),
+            t(2026, 1, 1),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha two"}),
+            t(2026, 5, 14),
+        )
+        .await
+        .unwrap();
+        let hits = ctrl
+            .search(&SearchQuery::new("alpha", tenant))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // α=1.0 → pure recency → newer event first.
+        assert!(hits[0].content.contains("two"));
+    }
+
+    #[tokio::test]
+    async fn alpha_recency_clamped_to_unit_interval() {
+        let high = ctrl().with_alpha_recency(5.0);
+        assert!((high.alpha_recency() - 1.0).abs() < 1e-6);
+        let low = ctrl().with_alpha_recency(-1.0);
+        assert!(low.alpha_recency().abs() < 1e-6);
     }
 
     // --- Reconsolidation labile window ---
