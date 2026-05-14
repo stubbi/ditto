@@ -193,6 +193,10 @@ pub struct MemoryController<S: Storage> {
     /// `consolidate(Dream)` runs the same extractor over recent episodic
     /// events in a sweep, for cases the per-write path missed.
     extractor: Option<Arc<dyn Extractor>>,
+    /// Multiplicative decay factor applied to all tenant salience values
+    /// in `LongSleep`. Values in (0.0, 1.0) shrink; 1.0 disables decay.
+    /// Default 0.95 — a salience of 0.5 hits 0.5 after ~14 sweeps.
+    long_sleep_decay: f32,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -233,6 +237,7 @@ impl<S: Storage> MemoryController<S> {
             // is NC-graph bi-temporal supersession in the dream cycle.
             alpha_recency: 0.0,
             extractor: None,
+            long_sleep_decay: 0.95,
         }
     }
 
@@ -281,6 +286,17 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn extractor(&self) -> Option<&Arc<dyn Extractor>> {
         self.extractor.as_ref()
+    }
+
+    /// Multiplicative decay factor applied to salience on each LongSleep
+    /// pass. Clamped to [0.0, 1.0]. 1.0 disables decay.
+    pub fn with_long_sleep_decay(mut self, factor: f32) -> Self {
+        self.long_sleep_decay = factor.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn long_sleep_decay(&self) -> f32 {
+        self.long_sleep_decay
     }
 
     pub fn with_labile_window(mut self, duration: Duration) -> Self {
@@ -1015,21 +1031,42 @@ impl<S: Storage> MemoryController<S> {
         match mode {
             ConsolidationMode::Ripple => self.run_ripple(tenant_id, scope_id, started).await,
             ConsolidationMode::Dream => self.run_dream(tenant_id, scope_id, started).await,
-            ConsolidationMode::LongSleep => Ok(ConsolidationReport {
-                mode,
-                tenant_id,
-                started_at: started,
-                finished_at: started,
-                events_examined: 0,
-                events_fit: 0,
-                events_tagged_for_dream: 0,
-                stub: true,
-                notes: "Long sleep pending — requires background scheduler \
-                        for decay sweep, retrieval-induced suppression, cold \
-                        subgraph archival, and spaced-retrieval self-testing."
-                    .into(),
-            }),
+            ConsolidationMode::LongSleep => self.run_long_sleep(tenant_id, started).await,
         }
+    }
+
+    /// One long-sleep pass for a single tenant. Decays salience by the
+    /// configured factor and prunes expired labile-window rows globally
+    /// (prune is per-process, not per-tenant — it's safe to call from
+    /// any tenant's pass). Retrieval-induced suppression and cold-subgraph
+    /// archival are deferred; v0 keeps the sweep deterministic and bounded.
+    async fn run_long_sleep(
+        &self,
+        tenant_id: TenantId,
+        started: DateTime<Utc>,
+    ) -> StorageResult<ConsolidationReport> {
+        let decayed = self
+            .storage
+            .decay_salience(tenant_id, self.long_sleep_decay)
+            .await?;
+        let pruned = self.storage.prune_expired_labile(Utc::now()).await?;
+        let finished = Utc::now();
+        Ok(ConsolidationReport {
+            mode: ConsolidationMode::LongSleep,
+            tenant_id,
+            started_at: started,
+            finished_at: finished,
+            events_examined: decayed,
+            events_fit: 0,
+            events_tagged_for_dream: 0,
+            stub: false,
+            notes: format!(
+                "Long sleep: decayed salience on {decayed} events (factor {:.3}); \
+                 pruned {pruned} expired labile rows. \
+                 Retrieval-induced suppression + cold-subgraph archival deferred.",
+                self.long_sleep_decay
+            ),
+        })
     }
 
     async fn run_dream(
@@ -3352,15 +3389,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_sleep_returns_stub_report() {
+    async fn long_sleep_decays_salience_and_prunes_labile() {
         let ctrl = ctrl();
         let tenant = TenantId::new();
-        let long = ctrl
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "x"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl.set_salience(tenant, r.event_id, 0.9).await.unwrap();
+        let report = ctrl
             .consolidate(tenant, None, ConsolidationMode::LongSleep)
             .await
             .unwrap();
-        assert!(long.stub);
-        assert!(long.notes.to_lowercase().contains("long sleep"));
+        assert!(!report.stub);
+        assert_eq!(report.events_examined, 1);
+        let after = ctrl.get_salience(tenant, r.event_id).await.unwrap().unwrap();
+        assert!(after < 0.9, "expected decay; got {after}");
+    }
+
+    #[tokio::test]
+    async fn long_sleep_decay_factor_is_configurable() {
+        let ctrl = ctrl().with_long_sleep_decay(0.5);
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "x"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl.set_salience(tenant, r.event_id, 1.0).await.unwrap();
+        ctrl.consolidate(tenant, None, ConsolidationMode::LongSleep)
+            .await
+            .unwrap();
+        let after = ctrl.get_salience(tenant, r.event_id).await.unwrap().unwrap();
+        // ≈0.5 — allow a small float epsilon.
+        assert!((after - 0.5).abs() < 1e-4, "expected ~0.5, got {after}");
     }
 
     // --- Extractor + dream cycle ---
