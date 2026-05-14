@@ -361,6 +361,22 @@ class LocomoBench(Benchmark):
                 details={"category": category, "error": f"judge: {e}", "gold": gold, "predicted": predicted},
             )
 
+        # Capture short snippets of the retrieved evidence so a post-hoc
+        # diagnostic can tell "right turn missing from retrieval" apart
+        # from "right turn in retrieval but model couldn't extract it".
+        retrieved_preview = [
+            {
+                "score": round(r.score, 4),
+                "snippet": r.content[:120],
+                "evidence_match": any(
+                    ev in (r.metadata or {}).get("dia_id", "")
+                    or ev in r.content
+                    for ev in q.get("evidence", [])
+                ),
+            }
+            for r in results[:5]
+        ]
+        evidence_in_topk = any(item["evidence_match"] for item in retrieved_preview)
         return ExampleResult(
             example_id=f"{tenant_id}#{q.get('evidence', ['?'])[0]}",
             passed=correct,
@@ -372,5 +388,7 @@ class LocomoBench(Benchmark):
                 "predicted": predicted,
                 "k_retrieved": len(results),
                 "adversarial": adversarial,
+                "evidence_in_topk": evidence_in_topk,
+                "retrieved_preview": retrieved_preview,
             },
         )
