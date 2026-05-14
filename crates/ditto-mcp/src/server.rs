@@ -35,7 +35,7 @@ use ditto_core::{
 };
 #[cfg(test)]
 use ditto_core::InstallKey;
-use ditto_memory::{MemoryController, SearchMode, SearchQuery, Storage};
+use ditto_memory::{ConsolidationMode, MemoryController, SearchMode, SearchQuery, Storage};
 
 /// Run a Ditto MCP server on stdio. Blocks until the client disconnects.
 pub async fn serve_stdio<S: Storage + 'static>(
@@ -166,6 +166,15 @@ pub struct GetBlobParams {
 pub struct VerifyReceiptParams {
     /// A receipt JSON object (as returned by write_event).
     pub receipt: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConsolidateParams {
+    pub tenant: String,
+    /// Optional scope filter; defaults to all scopes for the tenant.
+    pub scope: Option<String>,
+    /// `ripple` | `dream` | `long_sleep`. Default `dream`.
+    pub mode: Option<String>,
 }
 
 // --- Tool handlers ---
@@ -365,6 +374,24 @@ impl<S: Storage + 'static> DittoMcpServer<S> {
             serde_json::from_value(params.0.receipt).map_err(|e| bad_arg(e.to_string()))?;
         let valid = self.ctrl.verify(&receipt).await.map_err(storage_err)?;
         ok_json(&serde_json::json!({"valid": valid}))
+    }
+
+    #[tool(description = "Run a consolidation pass over the tenant's memory. Modes: ripple (fast tagging), dream (LLM extraction + KG supersession), long_sleep (salience decay + labile prune). Returns a ConsolidationReport.")]
+    async fn consolidate(
+        &self,
+        params: Parameters<ConsolidateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let tenant = parse_tenant(&p.tenant)?;
+        let scope = p.scope.as_deref().map(parse_scope).transpose()?;
+        let mode = match p.mode.as_deref().unwrap_or("dream") {
+            "ripple" => ConsolidationMode::Ripple,
+            "dream" => ConsolidationMode::Dream,
+            "long_sleep" | "longsleep" => ConsolidationMode::LongSleep,
+            other => return Err(bad_arg(format!("unknown consolidation mode: {other}"))),
+        };
+        let report = self.ctrl.consolidate(tenant, scope, mode).await.map_err(storage_err)?;
+        ok_json(&report)
     }
 }
 

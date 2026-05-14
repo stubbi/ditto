@@ -100,14 +100,27 @@ class DittoBackend(MemoryBackend):
             else:
                 embedder = "none"
         self._embedder = embedder
-        # Auto-enable the rule extractor when either a real embedder is on
-        # OR DITTO_EXTRACTOR is set explicitly. NC-graph supersession is
-        # what flips Provenance-Bench's temporal-update case (prov-002).
+        # Extractor selection:
+        # 1. explicit arg
+        # 2. DITTO_EXTRACTOR env
+        # 3. default to "rule" when an embedder is on, "none" otherwise.
+        #
+        # The `llm` option calls an OpenRouter-hosted model for every
+        # write — bench-grade quality, real cost. Use deliberately.
         if extractor is None:
             extractor = os.environ.get("DITTO_EXTRACTOR")
         if extractor is None:
             extractor = "rule" if self._embedder != "none" else "none"
         self._extractor = extractor
+        # Reranker — defaults to `none`; set DITTO_RERANKER=llm to enable
+        # OpenRouter-backed list-mode reranking. Adds one chat-completion
+        # round-trip per search.
+        self._reranker = os.environ.get("DITTO_RERANKER", "none")
+        # extract_on_write — defaults to true (matches Rust). LLM
+        # extractors should set this false via DITTO_EXTRACT_ON_WRITE=0
+        # so the write path doesn't block on network calls.
+        eow = os.environ.get("DITTO_EXTRACT_ON_WRITE", "1").lower()
+        self._extract_on_write = eow not in ("0", "false", "no")
         # Relevance gate / recency knobs — match the Rust defaults when
         # not passed; env override for batched bench runs.
         def _knob(arg: float | None, env: str, default: float) -> float:
@@ -144,12 +157,16 @@ class DittoBackend(MemoryBackend):
                 self._embedder,
                 "--extractor",
                 self._extractor,
+                "--reranker",
+                self._reranker,
                 "--min-relative-score",
                 str(self._min_relative_score),
                 "--min-absolute-cosine",
                 str(self._min_absolute_cosine),
                 "--alpha-recency",
                 str(self._alpha_recency),
+                "--extract-on-write",
+                "true" if self._extract_on_write else "false",
             ],
             env={**os.environ},
         )

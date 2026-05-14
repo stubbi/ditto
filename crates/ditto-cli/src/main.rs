@@ -25,6 +25,9 @@ use ditto_memory::embedder::{DeterministicEmbedder, Embedder};
 #[cfg(feature = "openai-embedder")]
 use ditto_memory::embedder::openai::OpenAiEmbedder;
 use ditto_memory::extractor::{Extractor, NoopExtractor, RuleExtractor};
+#[cfg(feature = "openai-embedder")]
+use ditto_memory::{LlmExtractor, LlmReranker};
+use ditto_memory::reranker::Reranker;
 use ditto_memory::{InMemoryStorage, MemoryController, SearchMode, SearchQuery, Storage};
 use ditto_render::{LocalFilesystem, RenderJob};
 use ditto_storage_postgres::PostgresStorage;
@@ -116,6 +119,17 @@ enum Cmd {
         /// 1 = pure recency.
         #[arg(long, default_value_t = 0.0)]
         alpha_recency: f32,
+        /// Whether to run the extractor inline on every write. Default
+        /// `true` (matches RuleExtractor). Set false for LLM extractors
+        /// — they should run dream-only so the write path stays fast.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        extract_on_write: bool,
+        /// Reranker selection. `none` (default) — search returns the
+        /// fused order as-is. `llm` — OpenRouter-hosted chat model
+        /// re-orders the top-K after RRF + gate. Requires `--features
+        /// openai-embedder`.
+        #[arg(long, default_value = "none")]
+        reranker: String,
     },
 }
 
@@ -234,16 +248,20 @@ async fn run_cmd<S: Storage + 'static>(
             min_relative_score,
             min_absolute_cosine,
             alpha_recency,
+            extract_on_write,
+            reranker,
         } => {
             // Hand control to the MCP server. Logs go to stderr (configured
             // earlier); stdio is reserved for the JSON-RPC framing.
             let _ = storage; // referenced via ctrl
             let ctrl = build_embedder(ctrl, &embedder)?;
             let ctrl = build_extractor(ctrl, &extractor)?;
+            let ctrl = build_reranker(ctrl, &reranker)?;
             let ctrl = ctrl
                 .with_min_relative_score(min_relative_score)
                 .with_min_absolute_cosine(min_absolute_cosine)
-                .with_alpha_recency(alpha_recency);
+                .with_alpha_recency(alpha_recency)
+                .with_extract_on_write(extract_on_write);
             serve_stdio(Arc::new(ctrl)).await?;
             Ok(())
         }
@@ -300,10 +318,52 @@ fn build_extractor<S: Storage + 'static>(
         "none" => None,
         "noop" => Some(Arc::new(NoopExtractor)),
         "rule" => Some(Arc::new(RuleExtractor::new())),
+        "llm" => {
+            #[cfg(feature = "openai-embedder")]
+            {
+                let e = LlmExtractor::from_env_openrouter()
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(Arc::new(e) as Arc<dyn Extractor>)
+            }
+            #[cfg(not(feature = "openai-embedder"))]
+            {
+                anyhow::bail!(
+                    "llm extractor not compiled in (rebuild with --features openai-embedder)"
+                );
+            }
+        }
         other => anyhow::bail!("unknown extractor selection: {other}"),
     };
     Ok(match extractor {
         Some(e) => ctrl.with_extractor(e),
+        None => ctrl,
+    })
+}
+
+fn build_reranker<S: Storage + 'static>(
+    ctrl: MemoryController<S>,
+    selection: &str,
+) -> Result<MemoryController<S>> {
+    let reranker: Option<Arc<dyn Reranker>> = match selection {
+        "none" => None,
+        "llm" => {
+            #[cfg(feature = "openai-embedder")]
+            {
+                let r = LlmReranker::from_env_openrouter()
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(Arc::new(r) as Arc<dyn Reranker>)
+            }
+            #[cfg(not(feature = "openai-embedder"))]
+            {
+                anyhow::bail!(
+                    "llm reranker not compiled in (rebuild with --features openai-embedder)"
+                );
+            }
+        }
+        other => anyhow::bail!("unknown reranker selection: {other}"),
+    };
+    Ok(match reranker {
+        Some(r) => ctrl.with_reranker(r),
         None => ctrl,
     })
 }

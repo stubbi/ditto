@@ -14,6 +14,8 @@ pub mod controller;
 pub mod embedder;
 pub mod extractor;
 pub mod in_memory;
+pub mod llm_extractor;
+pub mod llm_reranker;
 pub mod long_sleep;
 pub mod policy;
 pub mod reranker;
@@ -29,6 +31,12 @@ pub use embedder::{cosine, DeterministicEmbedder, Embedder, EmbedderError, EMBED
 pub use extractor::{name_to_node_id, Extraction, Extractor, NoopExtractor, ProposedFact, RuleExtractor};
 pub use in_memory::InMemoryStorage;
 pub use long_sleep::{LongSleepConfig, LongSleepScheduler, LongSleepTick};
+#[cfg(feature = "embedders-http")]
+pub use llm_extractor::LlmExtractor;
+pub use llm_extractor::LlmExtractorError;
+#[cfg(feature = "embedders-http")]
+pub use llm_reranker::LlmReranker;
+pub use llm_reranker::LlmRerankerError;
 pub use policy::{HeuristicPolicy, Operation, Policy, PolicyContext, RefusePolicy};
 pub use reranker::{NoopReranker, Reranker, ReverseReranker};
 pub use search::{

@@ -188,12 +188,18 @@ pub struct MemoryController<S: Storage> {
     /// (default — the architecture intends this to be learned per-tenant,
     /// not picked once and forgotten).
     alpha_recency: f32,
-    /// Optional fact extractor. When set, `write` runs extraction on the
-    /// committed payload and applies proposed facts to the NC-graph
-    /// (assert_node for src/dst, insert_edge with supersession policy).
-    /// `consolidate(Dream)` runs the same extractor over recent episodic
-    /// events in a sweep, for cases the per-write path missed.
+    /// Optional fact extractor. When set, `consolidate(Dream)` runs it
+    /// over recent episodic events and applies proposed facts to the
+    /// NC-graph. If `extract_on_write` is true (the default), `write`
+    /// also runs it inline — fine for cheap deterministic extractors
+    /// like `RuleExtractor`, NOT fine for an `LlmExtractor` that adds
+    /// a network round-trip per event. Set false to make extraction
+    /// dream-only for expensive extractors.
     extractor: Option<Arc<dyn Extractor>>,
+    /// When true, `write` calls `extractor.extract(event)` inline before
+    /// returning. When false, extraction happens only in
+    /// `consolidate(Dream)`. Default true.
+    extract_on_write: bool,
     /// Multiplicative decay factor applied to all tenant salience values
     /// in `LongSleep`. Values in (0.0, 1.0) shrink; 1.0 disables decay.
     /// Default 0.95 — a salience of 0.5 hits 0.5 after ~14 sweeps.
@@ -241,6 +247,7 @@ impl<S: Storage> MemoryController<S> {
             // is NC-graph bi-temporal supersession in the dream cycle.
             alpha_recency: 0.0,
             extractor: None,
+            extract_on_write: true,
             long_sleep_decay: 0.95,
             reranker: None,
         }
@@ -291,6 +298,19 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn extractor(&self) -> Option<&Arc<dyn Extractor>> {
         self.extractor.as_ref()
+    }
+
+    /// Configure when extraction runs. `true` (default) extracts on
+    /// every `write`. `false` extracts only in `consolidate(Dream)` —
+    /// the right setting for expensive LLM-backed extractors that
+    /// shouldn't add per-write latency.
+    pub fn with_extract_on_write(mut self, on: bool) -> Self {
+        self.extract_on_write = on;
+        self
+    }
+
+    pub fn extract_on_write(&self) -> bool {
+        self.extract_on_write
     }
 
     /// Multiplicative decay factor applied to salience on each LongSleep
@@ -374,13 +394,16 @@ impl<S: Storage> MemoryController<S> {
 
         self.storage.commit(&event, &receipt).await?;
 
-        // Auto-extract NC-graph facts when an extractor is configured.
-        // Like the embedder path, extraction failures don't roll back —
-        // worst case is the graph misses a fact that a re-run consolidation
-        // would have caught.
-        if let Some(_extr) = self.extractor.as_ref() {
-            if let Err(e) = self.apply_extraction(&event).await {
-                tracing::warn!(error = %e, "extractor failed; event is committed without NC-graph edges");
+        // Auto-extract NC-graph facts when an extractor is configured AND
+        // the controller is set to extract on write (cheap deterministic
+        // path). Expensive extractors (LLM-backed) should run dream-only
+        // — this gate prevents their network latency from creeping into
+        // the hot path. The dream sweep picks up any events missed here.
+        if self.extract_on_write {
+            if let Some(_extr) = self.extractor.as_ref() {
+                if let Err(e) = self.apply_extraction(&event).await {
+                    tracing::warn!(error = %e, "extractor failed; event is committed without NC-graph edges");
+                }
             }
         }
 
