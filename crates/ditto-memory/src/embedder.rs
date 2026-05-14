@@ -161,6 +161,25 @@ pub mod openai {
             Ok(Self::new(key))
         }
 
+        /// Construct an embedder pointed at OpenRouter's OpenAI-compatible
+        /// `/v1/embeddings` endpoint (verified 2026-05-14 against
+        /// openrouter.ai/docs/api/api-reference/embeddings/create-embeddings —
+        /// field names match OpenAI; the only deltas are `provider` routing
+        /// preferences which we don't set, and OpenRouter's `provider/model`
+        /// id namespacing which is why the default model becomes
+        /// `openai/text-embedding-3-small` rather than the bare id).
+        ///
+        /// Reads `OPENROUTER_API_KEY` from env. Useful when the user has an
+        /// OpenRouter subscription but no direct OpenAI key.
+        pub fn from_env_openrouter() -> Result<Self, EmbedderError> {
+            let key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
+                EmbedderError::Other("OPENROUTER_API_KEY not set".into())
+            })?;
+            Ok(Self::new(key)
+                .with_base_url("https://openrouter.ai/api/v1")
+                .with_model("openai/text-embedding-3-small"))
+        }
+
         pub fn with_model(mut self, model: impl Into<String>) -> Self {
             self.model = model.into();
             self

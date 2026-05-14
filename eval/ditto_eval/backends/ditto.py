@@ -74,12 +74,23 @@ class DittoBackend(MemoryBackend):
     def __init__(self, binary: Path | None = None, embedder: str | None = None) -> None:
         self._binary = binary or _default_binary()
         # Embedder selection passed to `ditto serve --embedder ...`. Resolution
-        # order: explicit arg → DITTO_EMBEDDER env → "openai" if OPENAI_API_KEY
-        # is set (the eval harness's intended path) → "none".
+        # order:
+        #   1. explicit arg
+        #   2. DITTO_EMBEDDER env
+        #   3. "openrouter" if OPENROUTER_API_KEY is set
+        #   4. "openai" if OPENAI_API_KEY is set
+        #   5. "none"
+        # OpenRouter is preferred when both keys are present because it gives
+        # the harness operator one billing relationship for the whole stack.
         if embedder is None:
             embedder = os.environ.get("DITTO_EMBEDDER")
         if embedder is None:
-            embedder = "openai" if os.environ.get("OPENAI_API_KEY") else "none"
+            if os.environ.get("OPENROUTER_API_KEY"):
+                embedder = "openrouter"
+            elif os.environ.get("OPENAI_API_KEY"):
+                embedder = "openai"
+            else:
+                embedder = "none"
         self._embedder = embedder
         self._stack: Any = None
         self._session: ClientSession | None = None

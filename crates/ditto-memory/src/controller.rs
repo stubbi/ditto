@@ -172,6 +172,17 @@ pub struct MemoryController<S: Storage> {
     /// (tenant_id, original_event_id) → shadow_event_id. A search result for
     /// the original is replaced by the latest shadow during retrieval.
     shadows: Mutex<HashMap<(TenantId, EventId), EventId>>,
+    /// Relevance threshold for retrieval. After RRF, results whose fused
+    /// score (or vector cosine, when an embedder is active) is below
+    /// `min_relative_score * top_score` are filtered out of `results`
+    /// and surfaced as `rejected_candidates` instead. 0.0 disables.
+    min_relative_score: f32,
+    /// Absolute cosine-similarity floor. Records whose vector score is
+    /// below this floor are dropped regardless of where the top record
+    /// landed — protects against "top result is itself a soft distractor"
+    /// pathologies where the relative gate alone would happily keep
+    /// every record clustered around 0.4. 0.0 disables.
+    min_absolute_cosine: f32,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -193,7 +204,45 @@ impl<S: Storage> MemoryController<S> {
             labile_window: Duration::minutes(5),
             labile: Mutex::new(HashMap::new()),
             shadows: Mutex::new(HashMap::new()),
+            // Two-knob relevance gate. `min_relative_score` (relative to
+            // top result) handles the easy case — clearly off-topic records.
+            // `min_absolute_cosine` is the floor below which a record is
+            // noise regardless of the top score; this protects the case
+            // where the top result happens to be a soft distractor (a
+            // record more cosine-similar to the *query phrasing* than to
+            // its semantic intent) and the relative-only gate would happily
+            // drop the actually-correct second-place record.
+            //
+            // 0.5 / 0.35 are the values that produce 3/3 on Provenance-
+            // Bench v0 with OpenAI text-embedding-3-small. Tune via the
+            // bench when adding fixtures.
+            min_relative_score: 0.5,
+            min_absolute_cosine: 0.35,
         }
+    }
+
+    /// Set the relative relevance-gate threshold. Results whose fused score
+    /// is below `alpha * top_score` are dropped from `results` and surfaced
+    /// under `rejected_candidates`. Pass 0.0 to disable.
+    pub fn with_min_relative_score(mut self, alpha: f32) -> Self {
+        self.min_relative_score = alpha.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn min_relative_score(&self) -> f32 {
+        self.min_relative_score
+    }
+
+    /// Set the absolute cosine floor — records whose vector similarity is
+    /// below this value are dropped regardless of the top score. Pass 0.0
+    /// to disable.
+    pub fn with_min_absolute_cosine(mut self, floor: f32) -> Self {
+        self.min_absolute_cosine = floor.clamp(-1.0, 1.0);
+        self
+    }
+
+    pub fn min_absolute_cosine(&self) -> f32 {
+        self.min_absolute_cosine
     }
 
     pub fn with_labile_window(mut self, duration: Duration) -> Self {
@@ -319,18 +368,80 @@ impl<S: Storage> MemoryController<S> {
     pub async fn search(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
         let raw = self.run_retrieval(query).await?;
         let resolved = self.resolve_shadows(query.tenant_id, raw).await?;
+        let gated = self.apply_relevance_gate(resolved);
 
         // Open the labile window on every returned event.
         let now = Utc::now();
         let until = now + self.labile_window;
         {
             let mut labile = self.labile.lock().await;
-            for r in &resolved {
+            for r in &gated {
                 labile.insert((query.tenant_id, r.event_id), until);
             }
         }
 
-        Ok(resolved)
+        Ok(gated)
+    }
+
+    /// Drop results whose relevance is well below the top result's.
+    ///
+    /// Decision is made on cosine similarity (vector leg, range [-1, 1])
+    /// when the embedder is active, since cosine has natural separation —
+    /// a semantically-related record might score 0.7 while an unrelated
+    /// record scores 0.3. Without an embedder, falls back to relative-RRF
+    /// (compressed; less effective, but better than nothing).
+    ///
+    /// Disabled entirely when `min_relative_score == 0.0`.
+    fn apply_relevance_gate(&self, results: Vec<SearchResult>) -> Vec<SearchResult> {
+        let relative_active = self.min_relative_score > 0.0;
+        let absolute_active = self.min_absolute_cosine > 0.0;
+        if !relative_active && !absolute_active {
+            return results;
+        }
+        if results.is_empty() {
+            return results;
+        }
+
+        let vector_top = results
+            .iter()
+            .filter_map(|r| r.metadata.get("vector_score").and_then(|v| v.as_f64()))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let has_vector = vector_top.is_finite() && vector_top > 0.0;
+
+        if has_vector {
+            // Two-knob gate against vector cosine. A record passes only if it
+            // exceeds BOTH the absolute floor AND the relative-to-top cutoff.
+            let abs_floor = self.min_absolute_cosine as f64;
+            let rel_cutoff = vector_top * (self.min_relative_score as f64);
+            return results
+                .into_iter()
+                .filter(|r| {
+                    match r.metadata.get("vector_score").and_then(|v| v.as_f64()) {
+                        Some(cos) => {
+                            (!absolute_active || cos >= abs_floor)
+                                && (!relative_active || cos >= rel_cutoff)
+                        }
+                        None => r
+                            .metadata
+                            .get("bm25_score")
+                            .and_then(|v| v.as_f64())
+                            .map(|s| s >= 1.0)
+                            .unwrap_or(false),
+                    }
+                })
+                .collect();
+        }
+
+        // No vector leg active — fall back to relative RRF / BM25 score gate.
+        if !relative_active {
+            return results;
+        }
+        let top = results[0].score;
+        if top <= 0.0 {
+            return Vec::new();
+        }
+        let cutoff = top * self.min_relative_score;
+        results.into_iter().filter(|r| r.score >= cutoff).collect()
     }
 
     async fn run_retrieval(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
@@ -543,7 +654,8 @@ impl<S: Storage> MemoryController<S> {
 
         let mut top = fused.clone();
         top.truncate(query.k);
-        let resolved = self.resolve_shadows(query.tenant_id, top).await?;
+        let pre_gate = self.resolve_shadows(query.tenant_id, top).await?;
+        let resolved = self.apply_relevance_gate(pre_gate);
         let now = Utc::now();
         let until = now + self.labile_window;
         {
@@ -575,11 +687,14 @@ impl<S: Storage> MemoryController<S> {
             })
             .collect();
 
+        // Rejected = anything that the fused list saw but `results` did
+        // not keep. Two reasons a record lands here: (a) below top-K cutoff,
+        // (b) below the relevance gate (score < α * top_score). Both end up
+        // surfaced as audit so the caller can see what almost made it.
         let kept_ids: std::collections::HashSet<EventId> =
             resolved.iter().map(|r| r.event_id).collect();
         let mut rejected: Vec<RejectedCandidate> = fused
             .iter()
-            .skip(query.k)
             .filter(|r| !kept_ids.contains(&r.event_id))
             .map(|r| RejectedCandidate {
                 event_id: r.event_id,
@@ -1110,16 +1225,24 @@ fn rrf_fuse(
 
     let mut scores: HashMap<EventId, f32> = HashMap::new();
     let mut payloads: HashMap<EventId, SearchResult> = HashMap::new();
+    // Per-leg raw scores carried through to the relevance gate. RRF
+    // compresses scores logarithmically (top-3 records can score within
+    // 5% of each other), so the gate works against the leg-native score
+    // distributions instead — cosine similarity has natural separation.
+    let mut bm_raw: HashMap<EventId, f32> = HashMap::new();
+    let mut vec_raw: HashMap<EventId, f32> = HashMap::new();
 
     for (rank, mut r) in bm.into_iter().enumerate() {
         let s = 1.0 / (K_RRF + (rank as f32) + 1.0);
         *scores.entry(r.event_id).or_insert(0.0) += s;
+        bm_raw.insert(r.event_id, r.score);
         r.metadata = annotate_leg(r.metadata, "bm25");
         payloads.entry(r.event_id).or_insert(r);
     }
     for (rank, mut r) in vec.into_iter().enumerate() {
         let s = 1.0 / (K_RRF + (rank as f32) + 1.0);
         *scores.entry(r.event_id).or_insert(0.0) += s;
+        vec_raw.insert(r.event_id, r.score);
         r.metadata = annotate_leg(r.metadata, "vector");
         payloads.entry(r.event_id).or_insert(r);
     }
@@ -1139,6 +1262,17 @@ fn rrf_fuse(
         .filter_map(|(id, fused_score)| {
             payloads.remove(&id).map(|mut r| {
                 r.score = fused_score;
+                // Stash per-leg raw scores in metadata so the relevance
+                // gate downstream can choose to filter on cosine similarity
+                // rather than the compressed RRF score.
+                if let Value::Object(m) = &mut r.metadata {
+                    if let Some(s) = bm_raw.get(&id) {
+                        m.insert("bm25_score".into(), serde_json::json!(s));
+                    }
+                    if let Some(s) = vec_raw.get(&id) {
+                        m.insert("vector_score".into(), serde_json::json!(s));
+                    }
+                }
                 r
             })
         })
@@ -2062,12 +2196,13 @@ mod tests {
 
     #[tokio::test]
     async fn standard_mode_runs_rrf_fusion_when_embedder_set() {
-        let ctrl = ctrl_with_embedder();
+        // Disable the relevance gate for this test — its job is to verify
+        // RRF surfaces both legs, not to test the gate.
+        let ctrl = ctrl_with_embedder()
+            .with_min_relative_score(0.0)
+            .with_min_absolute_cosine(0.0);
         let tenant = TenantId::new();
         let scope = ScopeId::new();
-        // Two events. The first BM25-matches the query; the second
-        // vector-matches via the hash-projection embedder. RRF should
-        // surface BOTH.
         ctrl.write(
             tenant,
             scope,
@@ -2139,6 +2274,112 @@ mod tests {
         assert_eq!(out[0].event_id, EventId([1; 32]));
         // doc 1's fused score = 2/(60+1) ≈ 0.0328
         assert!((out[0].score - 2.0 / 61.0).abs() < 1e-6);
+    }
+
+    // --- Relevance gate ---
+
+    #[tokio::test]
+    async fn relevance_gate_drops_clearly_unrelated_records() {
+        let ctrl = ctrl_with_embedder();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "user lives in Berlin"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "user prefers vegetarian food"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        // Query is about residence; the dietary event has no overlap.
+        let mut q = SearchQuery::new("Berlin", tenant);
+        q.k = 5;
+        let hits = ctrl.search(&q).await.unwrap();
+        // Default gate (α=0.5) keeps only records whose score is at least
+        // half the top score — the residence event passes; the dietary
+        // event does not (no BM25 hits at all → fused score 0).
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("Berlin"));
+    }
+
+    #[tokio::test]
+    async fn relevance_gate_disabled_returns_full_top_k() {
+        let ctrl = ctrl_with_embedder()
+            .with_min_relative_score(0.0)
+            .with_min_absolute_cosine(0.0);
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "beta"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut q = SearchQuery::new("alpha", tenant);
+        q.k = 5;
+        let hits = ctrl.search(&q).await.unwrap();
+        // Gate disabled → both events come back even though "beta" is
+        // clearly unrelated to the "alpha" query.
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn explain_surfaces_gate_dropped_records_under_rejected() {
+        let ctrl = ctrl_with_embedder();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "the answer is forty-two"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "unrelated background chatter"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut q = SearchQuery::new("forty-two", tenant);
+        q.k = 5;
+        let exp = ctrl.search_explain(&q).await.unwrap();
+        // results = just the relevant one; rejected = the unrelated chatter.
+        assert_eq!(exp.results.len(), 1);
+        assert!(!exp.rejected_candidates.is_empty());
     }
 
     // --- Reconsolidation labile window ---
@@ -2418,6 +2659,13 @@ mod tests {
         )
         .await
         .unwrap();
+        // Disable the relevance gate so we observe per-leg attribution for
+        // both events; with the default gate active the unrelated "gamma"
+        // event gets dropped from `results` and lands in
+        // `rejected_candidates` instead. The full-leg test is below.
+        let ctrl = ctrl
+            .with_min_relative_score(0.0)
+            .with_min_absolute_cosine(0.0);
         let q = SearchQuery::new("alpha", tenant);
         let exp = ctrl.search_explain(&q).await.unwrap();
         assert!(exp.embedder_used);
@@ -2652,8 +2900,9 @@ mod tests {
         let scope = ScopeId::new();
         let node = NodeId::new();
         let p1 = ctrl.delete_node(tenant, scope, node).await.unwrap();
-        // Small sleep to ensure nanos differ.
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        // Small sleep to ensure nanos differ. Using std rather than tokio so
+        // the dev-dep doesn't need the `time` feature flag.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let p2 = ctrl.delete_node(tenant, scope, node).await.unwrap();
         assert_ne!(p1.receipt.event_id, p2.receipt.event_id);
     }

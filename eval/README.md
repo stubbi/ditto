@@ -19,12 +19,20 @@ v0.0.1. Implemented:
 
 ```
 ditto-provenance-bench on stub:    0/3  score 0.000   (substring control floor)
-ditto-provenance-bench on ditto:   1/3  score 0.333   (RRF over BM25 + DeterministicEmbedder)
+ditto-provenance-bench on ditto:   2/3  score 0.667   (RRF + OpenAI embeddings + two-knob relevance gate)
 ```
 
-Trajectory: BM25-only (0/3) → BM25 + RRF + hash-projection embedder (1/3). Recall is now 1.0 on every case; the remaining two fails are **leak** issues (the retriever surfaces the right record AND a distractor), not retrieval gaps. Closing the leak gap needs late-interaction rerank (ColBERTv2 / MUVERA) on the top-50 — deferred per the v0 scope.
+Trajectory: BM25-only (0/3) → BM25 + RRF + deterministic embedder (1/3) → + relevance gate on cosine similarity (2/3).
 
-With `OPENAI_API_KEY` set, the harness wires `OpenAiEmbedder` instead of the deterministic one; expect Provenance-Bench to climb further as real semantic similarity replaces hash projection. Run with `DITTO_EMBEDDER=openai` (auto-selected when the key is in env) — see `crates/ditto-memory/src/embedder.rs::openai`.
+The remaining `prov-002-updated-fact` fail is structural, not a tuning gap:
+
+- prov-001 (passes): "When was the user born?" against a corpus where the right answer ("birthday March 14") has the **highest** cosine similarity. Threshold gate drops distractors.
+- prov-002 (fails): "Where does the user currently live?" against a corpus where the **older** record ("lives in SF") has *higher* cosine than the **newer** correct record ("moved to Berlin"). No purely-retrieval threshold can pick the temporally-newer record when its similarity score is lower.
+- prov-003 (passes): multi-hop, same shape as prov-001.
+
+These two examples need opposite temporal weights (prov-001 wants the *oldest* event; prov-002 wants the *newest*). A single ranking rule cannot satisfy both. The architecture's per-tenant-learned `α_recency` weight or its bi-temporal NC-graph supersession both solve this — both are deferred per the v0 memory scope. **The current ceiling is 2/3 by design.**
+
+With `OPENROUTER_API_KEY` or `OPENAI_API_KEY` set, the harness wires real semantic embeddings via `OpenAiEmbedder` (OpenRouter routes to `openai/text-embedding-3-small` at the same 1536 dim, no schema change). Auto-selected when the key is in env; override with `DITTO_EMBEDDER=openai|openrouter|deterministic|none`.
 
 Checked-in results under `results/` so the trajectory per backend per date is auditable. We deliberately do **not** publish Mem0/Zep/Mastra comparisons on `LongMemEval` / `BEAM` yet — Ditto's retrieval stack is incomplete, and the post-MemPalace-#214 methodology bar requires matched-conditions BM25 baselines at full corpus scale before any public comparison.
 

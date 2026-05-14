@@ -92,7 +92,8 @@ enum Cmd {
     Serve {
         /// Embedder for hybrid retrieval. `none` (default) → BM25 only;
         /// `deterministic` → in-process hash-projection (tests + CI);
-        /// `openai` → OpenAI text-embedding-3-small (reads OPENAI_API_KEY).
+        /// `openai` → OpenAI text-embedding-3-small (reads OPENAI_API_KEY);
+        /// `openrouter` → same model via OpenRouter (reads OPENROUTER_API_KEY).
         #[arg(long, default_value = "none")]
         embedder: String,
     },
@@ -235,6 +236,20 @@ fn build_embedder<S: Storage + 'static>(
             {
                 anyhow::bail!(
                     "openai embedder not compiled in (rebuild with --features openai-embedder)"
+                );
+            }
+        }
+        "openrouter" => {
+            #[cfg(feature = "openai-embedder")]
+            {
+                let e = OpenAiEmbedder::from_env_openrouter()
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(Arc::new(e))
+            }
+            #[cfg(not(feature = "openai-embedder"))]
+            {
+                anyhow::bail!(
+                    "openrouter embedder not compiled in (rebuild with --features openai-embedder)"
                 );
             }
         }
