@@ -114,6 +114,12 @@ class LocomoConfig:
     `top_k`: retrieval k handed to the backend's `search`.
 
     `qa_model` / `judge_model`: OpenRouter model IDs. Defaults are cheap.
+
+    `consolidate_after_ingest`: when true, calls
+    `backend.consolidate(tenant, mode="dream")` once after writing all
+    of a conversation's turns. Lets backends with an LLM extractor run
+    a single batched extraction pass instead of one extraction per
+    write — orders-of-magnitude faster on long conversations.
     """
 
     max_questions_per_category: int | None = None
@@ -122,6 +128,7 @@ class LocomoConfig:
     qa_model: str = "openai/gpt-4o-mini"
     judge_model: str = "openai/gpt-4o-mini"
     concurrency: int = 8
+    consolidate_after_ingest: bool = False
 
 
 QA_SYSTEM = (
@@ -237,6 +244,13 @@ class LocomoBench(Benchmark):
                         )
                         await backend.write(event)
                         prev = event.event_id
+
+                # Optionally trigger one batched dream sweep so backends
+                # with an LLM extractor get a chance to populate the
+                # NC-graph before QA. Cheap RuleExtractor backends ignore
+                # this — they extracted on-write.
+                if self.config.consolidate_after_ingest:
+                    await backend.consolidate(tenant_id, mode="dream")
 
                 # Run QA — concurrency-limited to avoid hammering OpenRouter.
                 qa = _stratify(conv["qa"], self.config.max_questions_per_category)

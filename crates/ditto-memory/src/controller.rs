@@ -200,6 +200,11 @@ pub struct MemoryController<S: Storage> {
     /// returning. When false, extraction happens only in
     /// `consolidate(Dream)`. Default true.
     extract_on_write: bool,
+    /// Max in-flight extractions during `consolidate(Dream)`. The
+    /// extractor's `extract` call is run inside a semaphore-bounded
+    /// `tokio::spawn` pool sized to this. NC-graph writes are still
+    /// serialized — only the extraction step parallelizes.
+    dream_extract_concurrency: usize,
     /// Multiplicative decay factor applied to all tenant salience values
     /// in `LongSleep`. Values in (0.0, 1.0) shrink; 1.0 disables decay.
     /// Default 0.95 — a salience of 0.5 hits 0.5 after ~14 sweeps.
@@ -248,6 +253,7 @@ impl<S: Storage> MemoryController<S> {
             alpha_recency: 0.0,
             extractor: None,
             extract_on_write: true,
+            dream_extract_concurrency: 8,
             long_sleep_decay: 0.95,
             reranker: None,
         }
@@ -311,6 +317,18 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn extract_on_write(&self) -> bool {
         self.extract_on_write
+    }
+
+    /// Max in-flight extractions during the dream sweep. Clamped to
+    /// 1+. Default 8. Bump for slow LLM extractors, lower for rate
+    /// limits.
+    pub fn with_dream_extract_concurrency(mut self, n: usize) -> Self {
+        self.dream_extract_concurrency = n.max(1);
+        self
+    }
+
+    pub fn dream_extract_concurrency(&self) -> usize {
+        self.dream_extract_concurrency
     }
 
     /// Multiplicative decay factor applied to salience on each LongSleep
@@ -1180,17 +1198,45 @@ impl<S: Storage> MemoryController<S> {
             });
         }
 
+        // Run extractions concurrently. The extractor is typically I/O
+        // bound (LLM HTTP round-trip), so a semaphore-bounded pool turns
+        // a 400-event sweep from 10 minutes serial into ~40s at
+        // concurrency 10. RuleExtractor is in-process; the speedup is
+        // negligible for it but the wrapper costs nothing either.
+        //
+        // NC-graph writes (`apply_extraction`) must remain serialized so
+        // supersession invalidations don't race — we collect extractions
+        // first, then apply them sequentially.
+        let extractor = self.extractor.as_ref().unwrap().clone();
+        let extraction_concurrency = self.dream_extract_concurrency.max(1);
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(extraction_concurrency));
+        let extract_handles: Vec<_> = ordered
+            .iter()
+            .map(|event| {
+                let sem = sem.clone();
+                let ev: Event = (*event).clone();
+                let extr = extractor.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                    let extraction = extr.extract(&ev).await;
+                    (ev, extraction)
+                })
+            })
+            .collect();
+
         let mut fit = 0_u32;
-        let extractor = self.extractor.as_ref().unwrap();
-        for event in &ordered {
-            let extraction = extractor.extract(event).await;
+        for handle in extract_handles {
+            let (event, extraction) = match handle.await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error = %e, "dream: extract task join failed");
+                    continue;
+                }
+            };
             if extraction.is_empty() {
                 continue;
             }
-            // Re-apply through the same helper write() uses. Idempotent on
-            // assert_node; supersession on insert_edge means re-running is
-            // a no-op rather than producing duplicates.
-            if let Err(e) = self.apply_extraction(event).await {
+            if let Err(e) = self.apply_extraction(&event).await {
                 tracing::warn!(error = %e, event_id = %event.event_id, "dream: apply_extraction failed");
                 continue;
             }

@@ -101,6 +101,16 @@ def main() -> None:
     help="LoCoMo: concurrent QA in-flight per conversation.",
 )
 @click.option(
+    "--locomo-consolidate/--no-locomo-consolidate",
+    default=None,
+    help=(
+        "LoCoMo: run backend.consolidate(dream) once after each "
+        "conversation's ingest. Auto-enabled when DITTO_EXTRACTOR=llm "
+        "and DITTO_EXTRACT_ON_WRITE=0 so the extractor sees a single "
+        "batched sweep instead of one call per write."
+    ),
+)
+@click.option(
     "--verbose/--quiet",
     default=False,
     help="Verbose: print every example. Quiet: print only category aggregates.",
@@ -116,6 +126,7 @@ def run(
     locomo_judge_model: str,
     locomo_top_k: int,
     locomo_concurrency: int,
+    locomo_consolidate: bool | None,
     verbose: bool,
 ) -> None:
     """Run a benchmark against a backend."""
@@ -130,6 +141,17 @@ def run(
                 if locomo_conversations
                 else None
             )
+            import os
+            if locomo_consolidate is None:
+                # Auto-enable when the LLM extractor is configured to run
+                # dream-only — that's the path that needs the explicit
+                # post-ingest sweep.
+                consolidate = (
+                    os.environ.get("DITTO_EXTRACTOR") == "llm"
+                    and os.environ.get("DITTO_EXTRACT_ON_WRITE", "1").lower() in ("0", "false", "no")
+                )
+            else:
+                consolidate = locomo_consolidate
             cfg = LocomoConfig(
                 max_questions_per_category=locomo_max_per_cat,
                 conversations=convs,
@@ -137,6 +159,7 @@ def run(
                 qa_model=locomo_qa_model,
                 judge_model=locomo_judge_model,
                 concurrency=locomo_concurrency,
+                consolidate_after_ingest=consolidate,
             )
             b = bench_cls(fixture_path, config=cfg)
         else:

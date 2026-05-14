@@ -58,5 +58,13 @@ class MemoryBackend(ABC):
     async def reset(self, tenant_id: str) -> None:
         """Wipe all data for `tenant_id`. Used between benchmark runs."""
 
+    async def consolidate(self, tenant_id: str, mode: str = "dream") -> dict | None:
+        """Optionally trigger a consolidation pass. Default no-op for
+        backends without one. Used by long-conversation benchmarks to
+        run a dream sweep after batch ingest, populating the NC-graph
+        before QA. Returns the backend's report dict if available.
+        """
+        return None
+
     async def close(self) -> None:
         """Release resources. Default no-op; backends with connections override."""

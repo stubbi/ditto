@@ -254,6 +254,21 @@ class DittoBackend(MemoryBackend):
         # destructive `reset_tenant` MCP tool is deliberately not exposed.
         return None
 
+    async def consolidate(self, tenant_id: str, mode: str = "dream") -> dict | None:
+        """Trigger a dream / ripple / long_sleep pass via the MCP
+        `consolidate` tool. Returns the ConsolidationReport dict or
+        None on failure (warning-logged; bench shouldn't abort).
+        """
+        session = await self._ensure_session()
+        try:
+            result = await session.call_tool(
+                "consolidate",
+                {"tenant": str(_to_uuid(tenant_id)), "mode": mode},
+            )
+            return _first_json(result)
+        except Exception:  # noqa: BLE001 — bench-level catch
+            return None
+
     async def close(self) -> None:
         if self._stack is not None:
             await self._stack.aclose()
