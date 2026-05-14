@@ -57,6 +57,7 @@ docs/
     multi-tenant.md      data model, tenancy hierarchy, auth, secrets, audit
     importer.md          one-shot import from hermes-agent and openclaw
     memory.md            v2: seven slots, controller, three-cadence replay, eval
+    models.md            Provider trait, SubscriptionBackend, JIT tool projection
   research/
     memory.md            synthesis entry point across all five vectors below
     memory/
@@ -65,6 +66,11 @@ docs/
       biology.md         neuroscience grounding (CLS, hippocampal indexing, etc.)
       production.md      forensic survey of ~30 deployed AI products
       trending.md        OSS velocity, practitioner pains/asks, surprise findings
+    models.md            synthesis entry point for the model-routing research
+    models/
+      landscape.md       LiteLLM, Vercel AI SDK, Rust ecosystem, provider divergence
+      oauth.md           every subscription-OAuth flow in 2026, TOS analysis
+      community.md       practitioner pain catalog (HN, X, Reddit, GitHub issues)
 eval/
   ditto-eval Python package — benchmark harness for memory backends
   (Mem0, Zep, Mastra, MemPalace, gbrain, Ditto). Eval-first: we measure
