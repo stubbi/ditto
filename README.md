@@ -18,7 +18,7 @@ Ditto's bet: a harness that owns memory coherence, runs with real OS sandboxing,
 
 ## Design pillars
 
-1. **Memory-coherence as a harness boundary.** Ditto is the single writer to memory. Typed slots (working / episodic / semantic / procedural) with explicit lifecycle, eviction, and provenance. See [`docs/research/memory.md`](docs/research/memory.md) (in-flight) and [`docs/architecture/memory.md`](docs/architecture/memory.md) (forthcoming).
+1. **Memory-coherence as a harness boundary.** Ditto is the single writer to memory. Five typed slots (working / episodic / semantic / procedural / reflective) with bi-temporal validity, content-addressed Ed25519-signed receipts, and Postgres-backed crash-consistency. See [`docs/architecture/memory.md`](docs/architecture/memory.md) for the commitment and [`docs/research/memory.md`](docs/research/memory.md) for the landscape research.
 2. **Secure-by-default execution.** macOS Seatbelt, Windows AppContainer, Linux Landlock as enforced defaults. Credential brokering — the agent process never holds raw API keys. Per-tool egress policy.
 3. **Subscription-native model routing.** Claude Code, Codex, ChatGPT OAuth as first-class. BYOK via OpenRouter/LiteLLM as fallback. JIT tool-schema projection — no 14k-token preamble per turn.
 4. **Multi-tenant from line one.** Org / tenant / workspace / agent hierarchy. Per-tenant secret vault. Postgres RLS. Audit log. See [`docs/architecture/multi-tenant.md`](docs/architecture/multi-tenant.md).
@@ -31,9 +31,9 @@ docs/
   architecture/
     multi-tenant.md      data model, tenancy hierarchy, auth, secrets, audit
     importer.md          one-shot import from hermes-agent and openclaw
-    memory.md            (forthcoming) Ditto's memory architecture
+    memory.md            five typed slots, write/read path, consolidation, eval
   research/
-    memory.md            (in-flight) state of the art in agent memory systems
+    memory.md            state of the art in agent memory systems (2025-2026)
 ```
 
 ## Migration
