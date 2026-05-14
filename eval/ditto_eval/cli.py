@@ -52,7 +52,14 @@ def main() -> None:
 @click.option("--benchmark", "-b", type=click.Choice(list(BENCHMARKS)), required=True)
 @click.option("--backend", "-k", type=click.Choice(list(BACKENDS)), required=True)
 @click.option("--fixture", "-f", type=click.Path(exists=True, path_type=Path), default=None)
-@click.option("--results-dir", "-r", type=click.Path(path_type=Path), default=Path("results"))
+@click.option(
+    "--results-dir",
+    "-r",
+    type=click.Path(path_type=Path),
+    # Default to the package's own results/ directory so runs from any cwd
+    # land in eval/results/, not <cwd>/results/. Override via `-r`.
+    default=Path(__file__).resolve().parent.parent / "results",
+)
 def run(benchmark: str, backend: str, fixture: Path | None, results_dir: Path) -> None:
     """Run a benchmark against a backend."""
     fixture_path = fixture or DEFAULT_FIXTURES[benchmark]
