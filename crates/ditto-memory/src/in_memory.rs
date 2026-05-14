@@ -52,6 +52,10 @@ struct Inner {
     /// (tenant_id, event_id) -> embedding. Tenant-scoped so a tenant reset
     /// purges its vectors alongside the rest.
     embeddings: HashMap<(TenantId, EventId), Vec<f32>>,
+    /// (tenant_id, event_id) -> labile_until.
+    labile: HashMap<(TenantId, EventId), DateTime<Utc>>,
+    /// (tenant_id, original) -> shadow event_id.
+    shadows: HashMap<(TenantId, EventId), EventId>,
 }
 
 impl InMemoryStorage {
@@ -150,6 +154,8 @@ impl Storage for InMemoryStorage {
         inner.skills.retain(|(t, _), _| *t != tenant_id);
         inner.reflective.retain(|_, r| r.tenant_id != tenant_id);
         inner.embeddings.retain(|(t, _), _| *t != tenant_id);
+        inner.labile.retain(|(t, _), _| *t != tenant_id);
+        inner.shadows.retain(|(t, _), _| *t != tenant_id);
         Ok(())
     }
 
@@ -672,6 +678,72 @@ impl Storage for InMemoryStorage {
             out.truncate(lim);
         }
         Ok(out)
+    }
+
+    async fn open_labile(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        until: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner
+            .labile
+            .entry((tenant_id, event_id))
+            .or_insert(until);
+        if until > *entry {
+            *entry = until;
+        }
+        Ok(())
+    }
+
+    async fn is_labile(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .labile
+            .get(&(tenant_id, event_id))
+            .copied()
+            .filter(|until| *until > now))
+    }
+
+    async fn prune_expired_labile(&self, now: DateTime<Utc>) -> StorageResult<u32> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.labile.len();
+        inner.labile.retain(|_, until| *until > now);
+        let removed = before - inner.labile.len();
+        Ok(removed as u32)
+    }
+
+    async fn write_shadow(
+        &self,
+        tenant_id: TenantId,
+        original: EventId,
+        shadow: EventId,
+        _authority: &str,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let key = (tenant_id, original);
+        if inner.shadows.contains_key(&key) {
+            return Err(StorageError::Other(format!(
+                "shadow already exists for {original}"
+            )));
+        }
+        inner.shadows.insert(key, shadow);
+        Ok(())
+    }
+
+    async fn lookup_shadow(
+        &self,
+        tenant_id: TenantId,
+        original: EventId,
+    ) -> StorageResult<Option<EventId>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.shadows.get(&(tenant_id, original)).copied())
     }
 
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {

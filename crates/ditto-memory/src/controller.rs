@@ -166,13 +166,9 @@ pub struct MemoryController<S: Storage> {
     embedder: Option<Arc<dyn Embedder>>,
     /// Reconsolidation labile window. Each event returned by `search` enters
     /// this window; while open, updates from a `Trusted` authority may
-    /// shadow the event with a corrected version.
+    /// shadow the event with a corrected version. Persisted in storage
+    /// (`labile_window` + `event_shadow` tables) — survives restart.
     labile_window: Duration,
-    /// (tenant_id, event_id) → labile_until. Pruned lazily on access.
-    labile: Mutex<HashMap<(TenantId, EventId), DateTime<Utc>>>,
-    /// (tenant_id, original_event_id) → shadow_event_id. A search result for
-    /// the original is replaced by the latest shadow during retrieval.
-    shadows: Mutex<HashMap<(TenantId, EventId), EventId>>,
     /// Relevance threshold for retrieval. After RRF, results whose fused
     /// score (or vector cosine, when an embedder is active) is below
     /// `min_relative_score * top_score` are filtered out of `results`
@@ -216,8 +212,6 @@ impl<S: Storage> MemoryController<S> {
             chain_heads: Mutex::new(HashMap::new()),
             embedder: None,
             labile_window: Duration::minutes(5),
-            labile: Mutex::new(HashMap::new()),
-            shadows: Mutex::new(HashMap::new()),
             // Two-knob relevance gate. `min_relative_score` (relative to
             // top result) handles the easy case — clearly off-topic records.
             // `min_absolute_cosine` is the floor below which a record is
@@ -427,10 +421,9 @@ impl<S: Storage> MemoryController<S> {
         // Open the labile window on every returned event.
         let now = Utc::now();
         let until = now + self.labile_window;
-        {
-            let mut labile = self.labile.lock().await;
-            for r in &gated {
-                labile.insert((query.tenant_id, r.event_id), until);
+        for r in &gated {
+            if let Err(e) = self.storage.open_labile(query.tenant_id, r.event_id, until).await {
+                tracing::warn!(error = %e, "open_labile failed; subsequent update() may reject as not-labile");
             }
         }
 
@@ -775,20 +768,19 @@ impl<S: Storage> MemoryController<S> {
         tenant_id: TenantId,
         mut results: Vec<SearchResult>,
     ) -> StorageResult<Vec<SearchResult>> {
-        let shadows = self.shadows.lock().await.clone();
-        if shadows.is_empty() {
-            return Ok(results);
-        }
         for r in results.iter_mut() {
             let mut cur = r.event_id;
             let mut hops = 0_usize;
-            // Bounded chain walk — prevents infinite loops if a shadow
-            // somehow points back to its source.
-            while let Some(next) = shadows.get(&(tenant_id, cur)) {
-                if *next == cur || hops > 8 {
+            // Bounded chain walk against persistent shadow rows — prevents
+            // infinite loops if a shadow somehow points back to its source.
+            while hops <= 8 {
+                let Some(next) = self.storage.lookup_shadow(tenant_id, cur).await? else {
+                    break;
+                };
+                if next == cur {
                     break;
                 }
-                cur = *next;
+                cur = next;
                 hops += 1;
             }
             if cur != r.event_id {
@@ -826,29 +818,19 @@ impl<S: Storage> MemoryController<S> {
 
         // Labile-window check.
         let now = Utc::now();
+        if self
+            .storage
+            .is_labile(tenant_id, event_id, now)
+            .await?
+            .is_none()
         {
-            let mut labile = self.labile.lock().await;
-            let key = (tenant_id, event_id);
-            match labile.get(&key) {
-                Some(until) if *until > now => {}
-                Some(_) => {
-                    labile.remove(&key);
-                    return Err(UpdateError::NotLabile { event_id });
-                }
-                None => return Err(UpdateError::NotLabile { event_id }),
-            }
+            return Err(UpdateError::NotLabile { event_id });
         }
 
         // Already-shadowed check — refuse to write a second shadow over the
         // same original, since the audit story gets confusing.
-        {
-            let shadows = self.shadows.lock().await;
-            if let Some(by) = shadows.get(&(tenant_id, event_id)) {
-                return Err(UpdateError::AlreadyShadowed {
-                    event_id,
-                    by: *by,
-                });
-            }
+        if let Some(by) = self.storage.lookup_shadow(tenant_id, event_id).await? {
+            return Err(UpdateError::AlreadyShadowed { event_id, by });
         }
 
         let original = self
@@ -882,10 +864,15 @@ impl<S: Storage> MemoryController<S> {
             )
             .await?;
 
-        {
-            let mut shadows = self.shadows.lock().await;
-            shadows.insert((tenant_id, event_id), receipt.event_id);
-        }
+        let authority_str = match authority {
+            Authority::User => "user",
+            Authority::VerifiedTool => "verified_tool",
+            Authority::SystemAdmin => "system_admin",
+            Authority::AgentContinuation => unreachable!("rejected above"),
+        };
+        self.storage
+            .write_shadow(tenant_id, event_id, receipt.event_id, authority_str)
+            .await?;
         Ok(receipt)
     }
 
@@ -945,10 +932,13 @@ impl<S: Storage> MemoryController<S> {
         let resolved = self.apply_recency_blend(self.apply_relevance_gate(pre_gate));
         let now = Utc::now();
         let until = now + self.labile_window;
-        {
-            let mut labile = self.labile.lock().await;
-            for r in &resolved {
-                labile.insert((query.tenant_id, r.event_id), until);
+        for r in &resolved {
+            if let Err(e) = self
+                .storage
+                .open_labile(query.tenant_id, r.event_id, until)
+                .await
+            {
+                tracing::warn!(error = %e, "open_labile (explain) failed");
             }
         }
 
@@ -1338,12 +1328,19 @@ impl<S: Storage> MemoryController<S> {
     /// Is the event currently within its labile window? Useful for callers
     /// who want to gate UI affordances ("this fact is editable").
     pub async fn is_labile(&self, tenant_id: TenantId, event_id: EventId) -> bool {
-        let now = Utc::now();
-        let labile = self.labile.lock().await;
-        labile
-            .get(&(tenant_id, event_id))
-            .map(|until| *until > now)
-            .unwrap_or(false)
+        self.storage
+            .is_labile(tenant_id, event_id, Utc::now())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Prune labile-window rows whose deadline has passed. Returns the
+    /// number of rows removed. Exposed for the long-sleep scheduler; safe
+    /// to call any time.
+    pub async fn prune_expired_labile(&self) -> StorageResult<u32> {
+        self.storage.prune_expired_labile(Utc::now()).await
     }
 
     pub async fn reset(&self, tenant_id: TenantId) -> StorageResult<()> {
@@ -3525,6 +3522,108 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let p2 = ctrl.delete_node(tenant, scope, node).await.unwrap();
         assert_ne!(p1.receipt.event_id, p2.receipt.event_id);
+    }
+
+    #[tokio::test]
+    async fn labile_state_survives_controller_recreation() {
+        // Both controllers wrap the SAME Arc<Storage>, so labile rows
+        // opened by the first remain visible to the second. This is
+        // what gives the architecture its persistence guarantee: a
+        // process restart doesn't lose the prompt-injection mitigation.
+        let storage = Arc::new(InMemoryStorage::new());
+        let key = Arc::new(InstallKey::generate());
+        let ctrl1 = MemoryController::new_with_arc(storage.clone(), key.clone());
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let receipt = ctrl1
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "v1"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl1
+            .search(&SearchQuery::new("v1", tenant))
+            .await
+            .unwrap();
+        // Drop ctrl1; rebuild on the same storage.
+        drop(ctrl1);
+        let ctrl2 = MemoryController::new_with_arc(storage, key);
+        // The labile window persisted — ctrl2 can update.
+        ctrl2.update(tenant, receipt.event_id, json!({"content": "v2"}), Authority::User)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shadow_chain_persists_across_controllers() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let key = Arc::new(InstallKey::generate());
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let ctrl1 = MemoryController::new_with_arc(storage.clone(), key.clone());
+        let r = ctrl1
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "lives in Berlin"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl1
+            .search(&SearchQuery::new("Berlin", tenant))
+            .await
+            .unwrap();
+        let shadow_receipt = ctrl1
+            .update(
+                tenant,
+                r.event_id,
+                json!({"content": "lives in Munich"}),
+                Authority::User,
+            )
+            .await
+            .unwrap();
+        drop(ctrl1);
+        // New controller, same storage — should see the shadow.
+        let ctrl2 = MemoryController::new_with_arc(storage, key);
+        // A second update from the recreated controller refuses
+        // because the shadow row already exists.
+        ctrl2
+            .search(&SearchQuery::new("Munich", tenant))
+            .await
+            .unwrap();
+        let err = ctrl2
+            .update(tenant, r.event_id, json!({"content": "moved again"}), Authority::User)
+            .await;
+        assert!(matches!(err, Err(UpdateError::AlreadyShadowed { by, .. }) if by == shadow_receipt.event_id));
+    }
+
+    #[tokio::test]
+    async fn prune_expired_labile_returns_count() {
+        let ctrl = ctrl().with_labile_window(Duration::seconds(0));
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "any"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        ctrl.search(&SearchQuery::new("any", tenant)).await.unwrap();
+        // 0-duration window means it's already expired by the time we prune.
+        let removed = ctrl.prune_expired_labile().await.unwrap();
+        assert!(removed >= 1);
     }
 
     #[tokio::test]

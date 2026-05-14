@@ -258,6 +258,16 @@ impl Storage for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Other(format!("reset reflective: {e}")))?;
+        sqlx::query("DELETE FROM labile_window WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset labile_window: {e}")))?;
+        sqlx::query("DELETE FROM event_shadow WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset event_shadow: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| StorageError::Other(format!("reset commit: {e}")))?;
@@ -984,6 +994,112 @@ impl Storage for PostgresStorage {
         .await
         .map_err(|e| StorageError::Other(format!("delete_blob: {e}")))?;
         Ok(n.rows_affected() > 0)
+    }
+
+    async fn open_labile(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        until: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        sqlx::query(
+            r#"INSERT INTO labile_window (tenant_id, event_id, labile_until)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (tenant_id, event_id) DO UPDATE
+                 SET labile_until = GREATEST(labile_window.labile_until, EXCLUDED.labile_until)"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&event_id.0[..])
+        .bind(until)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("open_labile: {e}")))?;
+        Ok(())
+    }
+
+    async fn is_labile(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let row = sqlx::query(
+            r#"SELECT labile_until
+               FROM labile_window
+               WHERE tenant_id = $1 AND event_id = $2 AND labile_until > $3"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&event_id.0[..])
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("is_labile: {e}")))?;
+        Ok(row.and_then(|r| r.try_get("labile_until").ok()))
+    }
+
+    async fn prune_expired_labile(&self, now: DateTime<Utc>) -> StorageResult<u32> {
+        let n = sqlx::query("DELETE FROM labile_window WHERE labile_until <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Other(format!("prune_expired_labile: {e}")))?;
+        Ok(u32::try_from(n.rows_affected()).unwrap_or(u32::MAX))
+    }
+
+    async fn write_shadow(
+        &self,
+        tenant_id: TenantId,
+        original: EventId,
+        shadow: EventId,
+        authority: &str,
+    ) -> StorageResult<()> {
+        let result = sqlx::query(
+            r#"INSERT INTO event_shadow (tenant_id, original, shadow, authority)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (tenant_id, original) DO NOTHING
+               RETURNING 1"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&original.0[..])
+        .bind(&shadow.0[..])
+        .bind(authority)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("write_shadow: {e}")))?;
+        if result.is_none() {
+            return Err(StorageError::Other(format!(
+                "shadow already exists for {original}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn lookup_shadow(
+        &self,
+        tenant_id: TenantId,
+        original: EventId,
+    ) -> StorageResult<Option<EventId>> {
+        let row = sqlx::query(
+            r#"SELECT shadow FROM event_shadow
+               WHERE tenant_id = $1 AND original = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&original.0[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("lookup_shadow: {e}")))?;
+        match row {
+            Some(r) => {
+                let bytes: Vec<u8> = r
+                    .try_get("shadow")
+                    .map_err(|e| StorageError::Other(format!("shadow col: {e}")))?;
+                Ok(Some(
+                    EventId::from_hex(&hex_lower(&bytes))
+                        .map_err(|e| StorageError::Other(format!("shadow decode: {e}")))?,
+                ))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn list_episodic(

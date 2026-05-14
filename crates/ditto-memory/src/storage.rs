@@ -284,6 +284,54 @@ pub trait Storage: Send + Sync {
         scope_id: Option<ScopeId>,
         limit: Option<usize>,
     ) -> StorageResult<Vec<Event>>;
+
+    // --- Reconsolidation labile window (persistent) ---
+
+    /// Open or extend the labile window for an event. Idempotent: a second
+    /// call with a later `until` extends; an earlier `until` is ignored.
+    async fn open_labile(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        until: DateTime<Utc>,
+    ) -> StorageResult<()>;
+
+    /// Returns the labile-until timestamp if the event is currently within
+    /// its labile window (not expired). Returns `None` otherwise.
+    async fn is_labile(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Option<DateTime<Utc>>>;
+
+    /// Bulk prune rows where `labile_until < now`. Returns the number of
+    /// rows removed. Used by the long-sleep scheduler.
+    async fn prune_expired_labile(
+        &self,
+        now: DateTime<Utc>,
+    ) -> StorageResult<u32>;
+
+    // --- Shadow chain (persistent) ---
+
+    /// Record `original` as having been shadowed by `shadow`. Errors if a
+    /// shadow already exists for `original` — controller logic must check
+    /// before writing (matches the in-process `AlreadyShadowed` error).
+    async fn write_shadow(
+        &self,
+        tenant_id: TenantId,
+        original: EventId,
+        shadow: EventId,
+        authority: &str,
+    ) -> StorageResult<()>;
+
+    /// Lookup the direct shadow for `original`. Returns `None` when the
+    /// event has never been shadowed.
+    async fn lookup_shadow(
+        &self,
+        tenant_id: TenantId,
+        original: EventId,
+    ) -> StorageResult<Option<EventId>>;
 }
 
 /// Side effects of a cascade delete — folded into the DeletionProof payload
