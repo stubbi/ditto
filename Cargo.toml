@@ -4,6 +4,7 @@ members = [
     "crates/ditto-core",
     "crates/ditto-memory",
     "crates/ditto-mcp",
+    "crates/ditto-models",
     "crates/ditto-render",
     "crates/ditto-storage-postgres",
     "crates/ditto-cli",
@@ -20,6 +21,7 @@ repository = "https://github.com/stubbi/ditto"
 ditto-core = { path = "crates/ditto-core", version = "0.0.1" }
 ditto-mcp = { path = "crates/ditto-mcp", version = "0.0.1" }
 ditto-memory = { path = "crates/ditto-memory", version = "0.0.1" }
+ditto-models = { path = "crates/ditto-models", version = "0.0.1" }
 ditto-render = { path = "crates/ditto-render", version = "0.0.1" }
 ditto-storage-postgres = { path = "crates/ditto-storage-postgres", version = "0.0.1" }
 
