@@ -71,7 +71,12 @@ class DittoBackend(MemoryBackend):
 
     name = "ditto"
 
-    def __init__(self, binary: Path | None = None, embedder: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: Path | None = None,
+        embedder: str | None = None,
+        extractor: str | None = None,
+    ) -> None:
         self._binary = binary or _default_binary()
         # Embedder selection passed to `ditto serve --embedder ...`. Resolution
         # order:
@@ -92,6 +97,14 @@ class DittoBackend(MemoryBackend):
             else:
                 embedder = "none"
         self._embedder = embedder
+        # Auto-enable the rule extractor when either a real embedder is on
+        # OR DITTO_EXTRACTOR is set explicitly. NC-graph supersession is
+        # what flips Provenance-Bench's temporal-update case (prov-002).
+        if extractor is None:
+            extractor = os.environ.get("DITTO_EXTRACTOR")
+        if extractor is None:
+            extractor = "rule" if self._embedder != "none" else "none"
+        self._extractor = extractor
         self._stack: Any = None
         self._session: ClientSession | None = None
         # Per-backend scope; the eval harness doesn't supply one. Stable so
@@ -107,7 +120,13 @@ class DittoBackend(MemoryBackend):
         self._stack = AsyncExitStack()
         params = StdioServerParameters(
             command=str(self._binary),
-            args=["serve", "--embedder", self._embedder],
+            args=[
+                "serve",
+                "--embedder",
+                self._embedder,
+                "--extractor",
+                self._extractor,
+            ],
             env={**os.environ},
         )
         read, write = await self._stack.enter_async_context(stdio_client(params))

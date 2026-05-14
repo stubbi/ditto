@@ -28,6 +28,7 @@ use ditto_core::{
 };
 
 use crate::embedder::Embedder;
+use crate::extractor::{name_to_node_id, Extractor};
 use crate::search::{
     RejectedCandidate, SearchExplained, SearchMode, SearchQuery, SearchResult,
     VectorSearchQuery, WhyRetrieved,
@@ -190,6 +191,12 @@ pub struct MemoryController<S: Storage> {
     /// (default — the architecture intends this to be learned per-tenant,
     /// not picked once and forgotten).
     alpha_recency: f32,
+    /// Optional fact extractor. When set, `write` runs extraction on the
+    /// committed payload and applies proposed facts to the NC-graph
+    /// (assert_node for src/dst, insert_edge with supersession policy).
+    /// `consolidate(Dream)` runs the same extractor over recent episodic
+    /// events in a sweep, for cases the per-write path missed.
+    extractor: Option<Arc<dyn Extractor>>,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -231,6 +238,7 @@ impl<S: Storage> MemoryController<S> {
             // trades fail-modes. The architecturally honest path to prov-002
             // is NC-graph bi-temporal supersession in the dream cycle.
             alpha_recency: 0.0,
+            extractor: None,
         }
     }
 
@@ -267,6 +275,18 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn alpha_recency(&self) -> f32 {
         self.alpha_recency
+    }
+
+    /// Attach a fact extractor. Writes and dream-cycle consolidation will
+    /// invoke it; produced facts become NC-graph edges with appropriate
+    /// supersession.
+    pub fn with_extractor(mut self, extractor: Arc<dyn Extractor>) -> Self {
+        self.extractor = Some(extractor);
+        self
+    }
+
+    pub fn extractor(&self) -> Option<&Arc<dyn Extractor>> {
+        self.extractor.as_ref()
     }
 
     pub fn with_labile_window(mut self, duration: Duration) -> Self {
@@ -326,6 +346,16 @@ impl<S: Storage> MemoryController<S> {
         };
 
         self.storage.commit(&event, &receipt).await?;
+
+        // Auto-extract NC-graph facts when an extractor is configured.
+        // Like the embedder path, extraction failures don't roll back —
+        // worst case is the graph misses a fact that a re-run consolidation
+        // would have caught.
+        if let Some(_extr) = self.extractor.as_ref() {
+            if let Err(e) = self.apply_extraction(&event).await {
+                tracing::warn!(error = %e, "extractor failed; event is committed without NC-graph edges");
+            }
+        }
 
         // Auto-embed when an embedder is configured. Failures here are
         // logged but do not roll back the commit — losing the embedding
@@ -416,6 +446,71 @@ impl<S: Storage> MemoryController<S> {
     /// (compressed; less effective, but better than nothing).
     ///
     /// Disabled entirely when `min_relative_score == 0.0`.
+    /// Run the configured extractor on `event` and apply its facts to the
+    /// NC-graph. Idempotent under repeat: nodes are upserted via
+    /// `assert_node`; edges with supersession invalidate priors atomically
+    /// in storage. The event's `event_id` is the provenance pointer.
+    async fn apply_extraction(&self, event: &Event) -> StorageResult<()> {
+        let Some(extractor) = self.extractor.as_ref() else {
+            return Ok(());
+        };
+        let extraction = extractor.extract(event).await;
+        if extraction.is_empty() {
+            return Ok(());
+        }
+        for fact in extraction.facts {
+            let src = name_to_node_id(event.tenant_id, event.scope_id, &fact.subject);
+            let dst = name_to_node_id(event.tenant_id, event.scope_id, &fact.object);
+            // Idempotency on (event_id, src, rel): if any current edge
+            // already cites this event_id under this relation, the dream
+            // sweep is replaying a fact write() already applied. Skip.
+            let existing = self
+                .storage
+                .current_edges_from(event.tenant_id, src, Some(fact.relation.as_str()))
+                .await?;
+            if existing.iter().any(|e| e.provenance.contains(&event.event_id)) {
+                continue;
+            }
+            self.storage
+                .assert_node(NewNode {
+                    node_id: src,
+                    tenant_id: event.tenant_id,
+                    scope_id: event.scope_id,
+                    node_type: "entity".into(),
+                    properties: serde_json::json!({ "name": fact.subject }),
+                    provenance: vec![event.event_id],
+                })
+                .await?;
+            self.storage
+                .assert_node(NewNode {
+                    node_id: dst,
+                    tenant_id: event.tenant_id,
+                    scope_id: event.scope_id,
+                    node_type: "entity".into(),
+                    properties: serde_json::json!({ "name": fact.object }),
+                    provenance: vec![event.event_id],
+                })
+                .await?;
+            let supersede = fact.supersede_policy();
+            self.storage
+                .insert_edge(NewEdge {
+                    edge_id: EdgeId::new(),
+                    src,
+                    dst,
+                    rel: fact.relation,
+                    strength: Some(fact.confidence),
+                    tenant_id: event.tenant_id,
+                    scope_id: event.scope_id,
+                    t_valid: event.timestamp,
+                    t_invalid: None,
+                    provenance: vec![event.event_id],
+                    supersede,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Blend recency into the final ranking. Each result's blended score is
     /// `(1 - α) * (score / top_score) + α * recency_factor`, where
     /// `recency_factor` is the result's rank-by-timestamp within the
@@ -489,11 +584,19 @@ impl<S: Storage> MemoryController<S> {
         if has_vector {
             // Two-knob gate against vector cosine. A record passes only if it
             // exceeds BOTH the absolute floor AND the relative-to-top cutoff.
+            // Exception: records that appeared in the KG leg are kept
+            // unconditionally — bi-temporal supersession on edges makes the
+            // KG hit authoritative, even when its cosine is low (the
+            // semantically-correct "moved to Berlin" event scores lower
+            // than the cosine-confounded "lives in San Francisco" baseline).
             let abs_floor = self.min_absolute_cosine as f64;
             let rel_cutoff = vector_top * (self.min_relative_score as f64);
             return results
                 .into_iter()
                 .filter(|r| {
+                    if r.metadata.get("kg_score").is_some() {
+                        return true;
+                    }
                     match r.metadata.get("vector_score").and_then(|v| v.as_f64()) {
                         Some(cos) => {
                             (!absolute_active || cos >= abs_floor)
@@ -523,9 +626,10 @@ impl<S: Storage> MemoryController<S> {
     }
 
     async fn run_retrieval(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
-        let do_vector = matches!(query.mode, SearchMode::Standard | SearchMode::Deep)
-            && self.embedder.is_some();
-        if !do_vector {
+        let standard_or_deep = matches!(query.mode, SearchMode::Standard | SearchMode::Deep);
+        let do_vector = standard_or_deep && self.embedder.is_some();
+        let do_kg = standard_or_deep; // KG-leg is cheap; always run in standard/deep
+        if !do_vector && !do_kg {
             return self.storage.search(query).await;
         }
 
@@ -538,24 +642,129 @@ impl<S: Storage> MemoryController<S> {
         bm_query.k = leg_k;
         let bm_results = self.storage.search(&bm_query).await?;
 
-        let emb = self.embedder.as_ref().unwrap();
-        let mut embs = emb
-            .embed(std::slice::from_ref(&query.query))
-            .await
-            .map_err(|e| StorageError::Other(format!("query embed: {e}")))?;
-        let q_emb = embs
-            .pop()
-            .ok_or_else(|| StorageError::Other("embedder returned no vectors".into()))?;
-        let vec_query = VectorSearchQuery {
-            embedding: q_emb,
-            tenant_id: query.tenant_id,
-            scope_id: query.scope_id,
-            sources: query.sources.clone(),
-            k: leg_k,
-        };
-        let vec_results = self.storage.search_vector(&vec_query).await?;
+        let mut vec_results: Vec<SearchResult> = Vec::new();
+        if do_vector {
+            let emb = self.embedder.as_ref().unwrap();
+            let mut embs = emb
+                .embed(std::slice::from_ref(&query.query))
+                .await
+                .map_err(|e| StorageError::Other(format!("query embed: {e}")))?;
+            if let Some(q_emb) = embs.pop() {
+                let vec_query = VectorSearchQuery {
+                    embedding: q_emb,
+                    tenant_id: query.tenant_id,
+                    scope_id: query.scope_id,
+                    sources: query.sources.clone(),
+                    k: leg_k,
+                };
+                vec_results = self.storage.search_vector(&vec_query).await?;
+            }
+        }
 
-        Ok(rrf_fuse(bm_results, vec_results, query.k))
+        let kg_results = if do_kg {
+            self.run_kg_leg(query, leg_k).await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(rrf_fuse_n(
+            &[bm_results, vec_results, kg_results],
+            query.k,
+        ))
+    }
+
+    /// KG-leg: lookup entities in the query against the tenant's NC-graph
+    /// node set, then surface current edges and synthesize SearchResults
+    /// pointing at each edge's most recent provenance event. This is what
+    /// makes bi-temporal supersession actually flow through to retrieval —
+    /// the right answer to "where does the user currently live?" is
+    /// whatever edge the dream-cycle's `lives_in` supersession landed on,
+    /// regardless of which leg's cosine surfaces in BM25/vector.
+    async fn run_kg_leg(
+        &self,
+        query: &SearchQuery,
+        leg_k: usize,
+    ) -> StorageResult<Vec<SearchResult>> {
+        let nodes = self.storage.list_nodes(query.tenant_id, query.scope_id).await?;
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Entity recognition v0: exact alphanumeric-token match of the
+        // query against each node's `properties.name` (which the extractor
+        // sets to the original subject/object string). LLM-driven entity
+        // linking is a follow-up.
+        let q_tokens: std::collections::HashSet<String> = query
+            .query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+
+        let mut matched_nodes: Vec<&Node> = Vec::new();
+        for node in &nodes {
+            let name = node
+                .properties
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let canon = name.trim().to_lowercase();
+            if canon.is_empty() {
+                continue;
+            }
+            // Multi-word node names (e.g., "san francisco") match if any
+            // of their tokens appears in the query.
+            let any_hit = canon
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .any(|t| q_tokens.contains(t));
+            if any_hit {
+                matched_nodes.push(node);
+            }
+        }
+
+        let mut results: Vec<SearchResult> = Vec::new();
+        for node in matched_nodes {
+            let edges = self
+                .storage
+                .current_edges_from(query.tenant_id, node.node_id, None)
+                .await?;
+            for edge in edges {
+                // Surface the edge's most recent provenance event as the
+                // canonical "source" for bench-scoring purposes.
+                let Some(&prov) = edge.provenance.last() else {
+                    continue;
+                };
+                let Some(target_event) = self.storage.get_event(&prov).await? else {
+                    continue;
+                };
+                let content = render_content(&target_event.payload);
+                let score = edge.strength.max(0.5); // baseline 0.5 so kg-only hits compete in RRF
+                results.push(SearchResult {
+                    event_id: target_event.event_id,
+                    content,
+                    score,
+                    source_event_ids: edge.provenance.clone(),
+                    metadata: serde_json::json!({
+                        "source_id": target_event.source_id,
+                        "timestamp": target_event.timestamp,
+                        "slot": target_event.slot,
+                        "leg": "kg",
+                        "kg_edge_rel": edge.rel,
+                    }),
+                });
+            }
+        }
+        // Stable order before truncation: highest strength first; tiebreak
+        // by event_id so the leg is byte-deterministic.
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.event_id.0.cmp(&b.event_id.0))
+        });
+        results.truncate(leg_k);
+        Ok(results)
     }
 
     /// Walk the shadow chain to the most recent un-shadowed event for each
@@ -815,22 +1024,7 @@ impl<S: Storage> MemoryController<S> {
         let started = Utc::now();
         match mode {
             ConsolidationMode::Ripple => self.run_ripple(tenant_id, scope_id, started).await,
-            ConsolidationMode::Dream => Ok(ConsolidationReport {
-                mode,
-                tenant_id,
-                started_at: started,
-                finished_at: started,
-                events_examined: 0,
-                events_fit: 0,
-                events_tagged_for_dream: 0,
-                stub: true,
-                notes: "Dream cycle pending — requires LLM Observer/Reflector \
-                        pipeline + Graphiti contradiction check + ADM \
-                        counterfactual verification. Tagged events are \
-                        currently consumed only by the Ripple deterministic \
-                        check; no extraction has happened yet."
-                    .into(),
-            }),
+            ConsolidationMode::Dream => self.run_dream(tenant_id, scope_id, started).await,
             ConsolidationMode::LongSleep => Ok(ConsolidationReport {
                 mode,
                 tenant_id,
@@ -846,6 +1040,78 @@ impl<S: Storage> MemoryController<S> {
                     .into(),
             }),
         }
+    }
+
+    async fn run_dream(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        started: DateTime<Utc>,
+    ) -> StorageResult<ConsolidationReport> {
+        // v0 dream is the rule-based extraction sweep — no LLM. Reads the
+        // most recent N episodic events and replays them through the
+        // configured extractor. Idempotent: re-running over the same
+        // events produces no duplicate edges because assert_node is
+        // upsert-on-id and insert_edge with supersession invalidates
+        // priors atomically.
+        const MAX_EVENTS: usize = 200;
+
+        let extractor_present = self.extractor.is_some();
+        if !extractor_present {
+            let finished = Utc::now();
+            return Ok(ConsolidationReport {
+                mode: ConsolidationMode::Dream,
+                tenant_id,
+                started_at: started,
+                finished_at: finished,
+                events_examined: 0,
+                events_fit: 0,
+                events_tagged_for_dream: 0,
+                stub: true,
+                notes: "Dream cycle pending — no extractor configured. \
+                        Attach one with `MemoryController::with_extractor`. \
+                        `RuleExtractor` is the deterministic v0 default."
+                    .into(),
+            });
+        }
+
+        let events = self
+            .storage
+            .list_episodic(tenant_id, scope_id, Some(MAX_EVENTS))
+            .await?;
+        let mut fit = 0_u32;
+        let extractor = self.extractor.as_ref().unwrap();
+        for event in &events {
+            let extraction = extractor.extract(event).await;
+            if extraction.is_empty() {
+                continue;
+            }
+            // Re-apply through the same helper write() uses. Idempotent on
+            // assert_node; supersession on insert_edge means re-running is
+            // a no-op rather than producing duplicates.
+            if let Err(e) = self.apply_extraction(event).await {
+                tracing::warn!(error = %e, event_id = %event.event_id, "dream: apply_extraction failed");
+                continue;
+            }
+            fit += 1;
+        }
+        let finished = Utc::now();
+        Ok(ConsolidationReport {
+            mode: ConsolidationMode::Dream,
+            tenant_id,
+            started_at: started,
+            finished_at: finished,
+            events_examined: events.len() as u32,
+            events_fit: fit,
+            events_tagged_for_dream: 0,
+            stub: false,
+            notes: format!(
+                "Rule-extractor sweep: applied facts from {fit} of {} events. \
+                 LLM-driven Observer/Reflector + Graphiti contradiction check \
+                 + ADM counterfactuals still deferred.",
+                events.len()
+            ),
+        })
     }
 
     async fn run_ripple(
@@ -1293,6 +1559,63 @@ fn render_content(payload: &Value) -> String {
 /// Content/metadata for the output is taken from whichever leg's payload
 /// appears first; both legs return identical-shape `SearchResult`s so this
 /// is sound.
+/// N-way RRF fusion. Each list contributes `1 / (K_RRF + rank + 1)` per
+/// record; scores sum across legs.
+fn rrf_fuse_n(legs: &[Vec<SearchResult>], top: usize) -> Vec<SearchResult> {
+    const K_RRF: f32 = 60.0;
+    use std::collections::HashMap;
+
+    let mut scores: HashMap<EventId, f32> = HashMap::new();
+    let mut payloads: HashMap<EventId, SearchResult> = HashMap::new();
+    let mut per_leg_raw: Vec<HashMap<EventId, f32>> = vec![HashMap::new(); legs.len()];
+
+    for (leg_idx, leg) in legs.iter().enumerate() {
+        let label = match leg_idx {
+            0 => "bm25",
+            1 => "vector",
+            2 => "kg",
+            _ => "other",
+        };
+        for (rank, r) in leg.iter().enumerate() {
+            let s = 1.0 / (K_RRF + (rank as f32) + 1.0);
+            *scores.entry(r.event_id).or_insert(0.0) += s;
+            per_leg_raw[leg_idx].insert(r.event_id, r.score);
+            let mut r = r.clone();
+            r.metadata = annotate_leg(r.metadata, label);
+            payloads.entry(r.event_id).or_insert(r);
+        }
+    }
+
+    let mut ordered: Vec<(EventId, f32)> = scores.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.0.cmp(&b.0.0))
+    });
+
+    ordered
+        .into_iter()
+        .take(top)
+        .filter_map(|(id, fused_score)| {
+            payloads.remove(&id).map(|mut r| {
+                r.score = fused_score;
+                if let Value::Object(m) = &mut r.metadata {
+                    if let Some(s) = per_leg_raw[0].get(&id) {
+                        m.insert("bm25_score".into(), serde_json::json!(s));
+                    }
+                    if let Some(s) = per_leg_raw.get(1).and_then(|h| h.get(&id)) {
+                        m.insert("vector_score".into(), serde_json::json!(s));
+                    }
+                    if let Some(s) = per_leg_raw.get(2).and_then(|h| h.get(&id)) {
+                        m.insert("kg_score".into(), serde_json::json!(s));
+                    }
+                }
+                r
+            })
+        })
+        .collect()
+}
+
 fn rrf_fuse(
     bm: Vec<SearchResult>,
     vec: Vec<SearchResult>,
@@ -2784,7 +3107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dream_and_long_sleep_return_stub_reports() {
+    async fn dream_without_extractor_returns_stub_report() {
         let ctrl = ctrl();
         let tenant = TenantId::new();
         let dream = ctrl
@@ -2792,13 +3115,141 @@ mod tests {
             .await
             .unwrap();
         assert!(dream.stub);
-        assert!(dream.notes.to_lowercase().contains("dream"));
+        assert!(dream.notes.to_lowercase().contains("no extractor"));
+    }
+
+    #[tokio::test]
+    async fn long_sleep_returns_stub_report() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
         let long = ctrl
             .consolidate(tenant, None, ConsolidationMode::LongSleep)
             .await
             .unwrap();
         assert!(long.stub);
         assert!(long.notes.to_lowercase().contains("long sleep"));
+    }
+
+    // --- Extractor + dream cycle ---
+
+    fn ctrl_with_extractor() -> MemoryController<InMemoryStorage> {
+        use crate::extractor::RuleExtractor;
+        MemoryController::new(InMemoryStorage::new(), InstallKey::generate())
+            .with_extractor(Arc::new(RuleExtractor::new()))
+    }
+
+    #[tokio::test]
+    async fn write_with_extractor_lands_facts_in_nc_graph() {
+        let ctrl = ctrl_with_extractor();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "User lives in San Francisco, works at Acme Corp."}),
+            t(2026, 1, 1),
+        )
+        .await
+        .unwrap();
+        let user = crate::extractor::name_to_node_id(tenant, scope, "user");
+        let edges = ctrl.current_edges_from(tenant, user, None).await.unwrap();
+        let rels: Vec<&str> = edges.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"lives_in"));
+        assert!(rels.contains(&"works_at"));
+    }
+
+    #[tokio::test]
+    async fn moved_to_supersedes_prior_lives_in() {
+        let ctrl = ctrl_with_extractor();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "User lives in San Francisco, works at Acme Corp."}),
+            t(2026, 1, 1),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "User moved to Berlin last week, starting at Beta Inc next Monday."}),
+            t(2026, 5, 14),
+        )
+        .await
+        .unwrap();
+        let user = crate::extractor::name_to_node_id(tenant, scope, "user");
+        let edges = ctrl
+            .current_edges_from(tenant, user, Some("lives_in"))
+            .await
+            .unwrap();
+        // After supersession only one current lives_in edge survives — the
+        // one pointing at the Berlin node.
+        assert_eq!(edges.len(), 1);
+        let berlin = crate::extractor::name_to_node_id(tenant, scope, "berlin last week");
+        assert_eq!(edges[0].dst, berlin);
+    }
+
+    #[tokio::test]
+    async fn dream_cycle_applies_facts_in_sweep() {
+        let ctrl = ctrl_with_extractor();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        // Pre-write events with the extractor configured; auto-extract will
+        // already populate the graph during write. The dream sweep should be
+        // idempotent — re-running produces no new edges or duplicates.
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "User is allergic to peanuts."}),
+            t(2026, 1, 1),
+        )
+        .await
+        .unwrap();
+        let report = ctrl
+            .consolidate(tenant, None, ConsolidationMode::Dream)
+            .await
+            .unwrap();
+        assert!(!report.stub);
+        assert_eq!(report.events_examined, 1);
+        assert_eq!(report.events_fit, 1);
+        // Sanity: only one allergic_to edge exists (no duplication from the
+        // double application via write + dream).
+        let user = crate::extractor::name_to_node_id(tenant, scope, "user");
+        let edges = ctrl
+            .current_edges_from(tenant, user, Some("allergic_to"))
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_without_extractor_does_not_touch_graph() {
+        let ctrl = ctrl(); // no extractor
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "User lives in San Francisco."}),
+            t(2026, 1, 1),
+        )
+        .await
+        .unwrap();
+        let user = crate::extractor::name_to_node_id(tenant, scope, "user");
+        let edges = ctrl.current_edges_from(tenant, user, None).await.unwrap();
+        assert!(edges.is_empty());
     }
 
     // --- Explain / export / import ---

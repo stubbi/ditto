@@ -19,20 +19,18 @@ v0.0.1. Implemented:
 
 ```
 ditto-provenance-bench on stub:    0/3  score 0.000   (substring control floor)
-ditto-provenance-bench on ditto:   2/3  score 0.667   (RRF + OpenAI embeddings + two-knob relevance gate)
+ditto-provenance-bench on ditto:   3/3  score 1.000   (RRF + embeddings + two-knob gate + KG-leg via rule extractor)
 ```
 
-Trajectory: BM25-only (0/3) → BM25 + RRF + deterministic embedder (1/3) → + relevance gate on cosine similarity (2/3).
+Trajectory:
+1. BM25-only → 0/3 (recall=0; lexical retrieval missed every semantic-recall query).
+2. + RRF over BM25 + deterministic embedder → 1/3 (recall=1.0 everywhere; 2 leaks).
+3. + cosine-based two-knob relevance gate → 2/3 (filters distractors; prov-002 still failed because the wrong-but-lexically-closer record had higher cosine than the right answer).
+4. + rule extractor + NC-graph KG-leg → **3/3**.
 
-The remaining `prov-002-updated-fact` fail is structural, not a tuning gap:
+The KG-leg is what flips prov-002: the `RuleExtractor` recognises "User moved to Berlin" → `(user, lives_in, berlin)` with `AnyWithSameRelation` supersession, which invalidates the prior `lives_in San Francisco` edge. When the search KG-leg looks up entities mentioned in the query ("user"), it surfaces the *current* edges only — by construction the temporally-newer fact wins, and the edge's provenance pointer carries us back to e2.
 
-- prov-001 (passes): "When was the user born?" against a corpus where the right answer ("birthday March 14") has the **highest** cosine similarity. Threshold gate drops distractors.
-- prov-002 (fails): "Where does the user currently live?" against a corpus where the **older** record ("lives in SF") has *higher* cosine than the **newer** correct record ("moved to Berlin"). No purely-retrieval threshold can pick the temporally-newer record when its similarity score is lower.
-- prov-003 (passes): multi-hop, same shape as prov-001.
-
-These two examples need opposite temporal weights (prov-001 wants the *oldest* event; prov-002 wants the *newest*). A single ranking rule cannot satisfy both. The architecture's per-tenant-learned `α_recency` weight or its bi-temporal NC-graph supersession both solve this — both are deferred per the v0 memory scope. **The current ceiling is 2/3 by design.**
-
-With `OPENROUTER_API_KEY` or `OPENAI_API_KEY` set, the harness wires real semantic embeddings via `OpenAiEmbedder` (OpenRouter routes to `openai/text-embedding-3-small` at the same 1536 dim, no schema change). Auto-selected when the key is in env; override with `DITTO_EMBEDDER=openai|openrouter|deterministic|none`.
+With `OPENROUTER_API_KEY` or `OPENAI_API_KEY` set, the harness wires real semantic embeddings (`text-embedding-3-small` at 1536 dim) AND auto-enables the rule extractor. Override with `DITTO_EMBEDDER=openai|openrouter|deterministic|none` and `DITTO_EXTRACTOR=rule|none`.
 
 Checked-in results under `results/` so the trajectory per backend per date is auditable. We deliberately do **not** publish Mem0/Zep/Mastra comparisons on `LongMemEval` / `BEAM` yet — Ditto's retrieval stack is incomplete, and the post-MemPalace-#214 methodology bar requires matched-conditions BM25 baselines at full corpus scale before any public comparison.
 

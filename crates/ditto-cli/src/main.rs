@@ -24,6 +24,7 @@ use ditto_mcp::serve_stdio;
 use ditto_memory::embedder::{DeterministicEmbedder, Embedder};
 #[cfg(feature = "openai-embedder")]
 use ditto_memory::embedder::openai::OpenAiEmbedder;
+use ditto_memory::extractor::{Extractor, NoopExtractor, RuleExtractor};
 use ditto_memory::{InMemoryStorage, MemoryController, SearchMode, SearchQuery, Storage};
 use ditto_render::{LocalFilesystem, RenderJob};
 use ditto_storage_postgres::PostgresStorage;
@@ -96,6 +97,12 @@ enum Cmd {
         /// `openrouter` → same model via OpenRouter (reads OPENROUTER_API_KEY).
         #[arg(long, default_value = "none")]
         embedder: String,
+        /// Fact extractor for NC-graph auto-population. `none` (default)
+        /// → graph stays empty unless code manually writes; `rule` →
+        /// deterministic pattern matcher (lives_in / moved_to / works_at /
+        /// allergic_to). LLM-driven extractor is a follow-up.
+        #[arg(long, default_value = "none")]
+        extractor: String,
     },
 }
 
@@ -208,11 +215,15 @@ async fn run_cmd<S: Storage + 'static>(
             );
             Ok(())
         }
-        Cmd::Serve { embedder } => {
+        Cmd::Serve {
+            embedder,
+            extractor,
+        } => {
             // Hand control to the MCP server. Logs go to stderr (configured
             // earlier); stdio is reserved for the JSON-RPC framing.
             let _ = storage; // referenced via ctrl
             let ctrl = build_embedder(ctrl, &embedder)?;
+            let ctrl = build_extractor(ctrl, &extractor)?;
             serve_stdio(Arc::new(ctrl)).await?;
             Ok(())
         }
@@ -257,6 +268,22 @@ fn build_embedder<S: Storage + 'static>(
     };
     Ok(match embedder {
         Some(e) => ctrl.with_embedder(e),
+        None => ctrl,
+    })
+}
+
+fn build_extractor<S: Storage + 'static>(
+    ctrl: MemoryController<S>,
+    selection: &str,
+) -> Result<MemoryController<S>> {
+    let extractor: Option<Arc<dyn Extractor>> = match selection {
+        "none" => None,
+        "noop" => Some(Arc::new(NoopExtractor)),
+        "rule" => Some(Arc::new(RuleExtractor::new())),
+        other => anyhow::bail!("unknown extractor selection: {other}"),
+    };
+    Ok(match extractor {
+        Some(e) => ctrl.with_extractor(e),
         None => ctrl,
     })
 }
