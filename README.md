@@ -34,6 +34,11 @@ docs/
     memory.md            five typed slots, write/read path, consolidation, eval
   research/
     memory.md            state of the art in agent memory systems (2025-2026)
+eval/
+  ditto-eval Python package — benchmark harness for memory backends
+  (Mem0, Zep, Mastra, MemPalace, gbrain, Ditto). Eval-first: we measure
+  incumbents on the same fixtures we'll measure ourselves on, before
+  writing any memory-engine code. See eval/README.md.
 ```
 
 ## Migration

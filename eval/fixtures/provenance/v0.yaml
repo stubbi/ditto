@@ -1,0 +1,65 @@
+version: 1
+benchmark: ditto-provenance-bench
+description: |
+  Given a question, the backend must return memory records whose source_event_ids
+  point at the specific episodic events that contain the answer. Tests whether
+  the backend can attribute its answer. Backends without provenance tracking
+  score 0 here.
+
+examples:
+  - id: prov-001-birthday
+    setup:
+      events:
+        - id: e1
+          content: "User mentioned their birthday is March 14, 1992."
+          timestamp: 1700000000.0
+        - id: e2
+          content: "User asked about restaurants in Berlin near Mitte."
+          timestamp: 1700000100.0
+        - id: e3
+          content: "User said they prefer vegetarian food, no mushrooms."
+          timestamp: 1700000200.0
+        - id: e4
+          content: "User confirmed their pronouns are they/them."
+          timestamp: 1700000300.0
+    query: "When was the user born?"
+    k: 5
+    must_include_source_events: [e1]
+    must_not_include_source_events: [e2, e3, e4]
+
+  - id: prov-002-updated-fact
+    setup:
+      events:
+        - id: e1
+          content: "User lives in San Francisco, works at Acme Corp."
+          timestamp: 1700000000.0
+        - id: e2
+          content: "User moved to Berlin last week, starting at Beta Inc next Monday."
+          timestamp: 1710000000.0
+        - id: e3
+          content: "User is learning German."
+          timestamp: 1710100000.0
+    query: "Where does the user currently live?"
+    k: 5
+    must_include_source_events: [e2]
+    must_not_include_source_events: []
+
+  - id: prov-003-multi-hop
+    setup:
+      events:
+        - id: e1
+          content: "User is allergic to peanuts."
+          timestamp: 1700000000.0
+        - id: e2
+          content: "User asked to book a flight to Tokyo for a sushi tour."
+          timestamp: 1700000100.0
+        - id: e3
+          content: "User's emergency contact is Maria, phone +49-30-12345."
+          timestamp: 1700000200.0
+        - id: e4
+          content: "User said they love hiking in the Alps."
+          timestamp: 1700000300.0
+    query: "What dietary restriction should be flagged on the flight booking?"
+    k: 5
+    must_include_source_events: [e1]
+    must_not_include_source_events: [e3]
