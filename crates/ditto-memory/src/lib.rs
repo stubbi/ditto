@@ -14,8 +14,10 @@ pub mod controller;
 pub mod in_memory;
 pub mod search;
 pub mod storage;
+pub mod working;
 
 pub use controller::MemoryController;
 pub use in_memory::InMemoryStorage;
 pub use search::{SearchMode, SearchQuery, SearchResult};
 pub use storage::Storage;
+pub use working::{Observation, ObservationKind, WorkingMemory};
