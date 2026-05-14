@@ -26,7 +26,8 @@ use ditto_core::{
     SkillId, SkillStatus, Slot, TenantId, CURRENT_SCHEMA_VERSION,
 };
 
-use crate::search::{SearchQuery, SearchResult};
+use crate::embedder::Embedder;
+use crate::search::{SearchMode, SearchQuery, SearchResult, VectorSearchQuery};
 use crate::storage::{Storage, StorageError, StorageResult};
 
 #[derive(Clone, Copy)]
@@ -43,6 +44,11 @@ pub struct MemoryController<S: Storage> {
     signing: SigningPolicy,
     schema_version: SchemaVersion,
     chain_heads: Mutex<HashMap<(TenantId, String), EventId>>,
+    /// Optional embedder. When set, `write` auto-embeds payload content into
+    /// the episodic vector slot, and `search` runs RRF over BM25 + vector
+    /// in Standard / Deep mode. When None, vector retrieval is skipped and
+    /// every mode falls back to BM25.
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -60,12 +66,22 @@ impl<S: Storage> MemoryController<S> {
             signing: SigningPolicy::Required,
             schema_version: CURRENT_SCHEMA_VERSION,
             chain_heads: Mutex::new(HashMap::new()),
+            embedder: None,
         }
     }
 
     pub fn with_signing_policy(mut self, policy: SigningPolicy) -> Self {
         self.signing = policy;
         self
+    }
+
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {
+        self.embedder.as_ref()
     }
 
     pub fn storage(&self) -> &S {
@@ -103,6 +119,32 @@ impl<S: Storage> MemoryController<S> {
 
         self.storage.commit(&event, &receipt).await?;
 
+        // Auto-embed when an embedder is configured. Failures here are
+        // logged but do not roll back the commit — losing the embedding
+        // costs vector-recall quality on this one event, but the event
+        // itself is still durable and BM25-recoverable. Re-running with an
+        // embedder restored will re-index.
+        if let Some(emb) = &self.embedder {
+            let text = render_content(&event.payload);
+            if !text.is_empty() {
+                match emb.embed(&[text]).await {
+                    Ok(vectors) => {
+                        if let Some(v) = vectors.into_iter().next() {
+                            if let Err(e) =
+                                self.storage.put_embedding(tenant_id, event.event_id, &v).await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    "put_embedding failed; event is committed but vector-unindexed"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "embed failed; skipping vector index"),
+                }
+            }
+        }
+
         {
             let mut heads = self.chain_heads.lock().await;
             heads.insert((tenant_id, source_id), event.event_id);
@@ -121,8 +163,48 @@ impl<S: Storage> MemoryController<S> {
         Ok(receipt.verify(&event, &verifier).is_ok())
     }
 
+    /// Hybrid retrieval.
+    ///
+    /// - `SearchMode::Cheap` → BM25 only.
+    /// - `SearchMode::Standard` / `Deep` → BM25 + vector, RRF-fused, when an
+    ///   embedder is configured. Otherwise falls back to BM25.
+    ///
+    /// Late-interaction rerank (ColBERTv2 / MUVERA) and query expansion are
+    /// the Standard→Deep delta in the v2 spec; both are follow-ups.
     pub async fn search(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
-        self.storage.search(query).await
+        let do_vector = matches!(query.mode, SearchMode::Standard | SearchMode::Deep)
+            && self.embedder.is_some();
+        if !do_vector {
+            return self.storage.search(query).await;
+        }
+
+        // Oversample 3x per leg before fusion. RRF with K=60 places most
+        // mass in the top ~15; pulling 3*k gives the fusion room to pick
+        // up dual-hits beyond either leg's top-k.
+        let leg_k = query.k.saturating_mul(3).max(query.k);
+
+        let mut bm_query = query.clone();
+        bm_query.k = leg_k;
+        let bm_results = self.storage.search(&bm_query).await?;
+
+        let emb = self.embedder.as_ref().unwrap();
+        let mut embs = emb
+            .embed(std::slice::from_ref(&query.query))
+            .await
+            .map_err(|e| StorageError::Other(format!("query embed: {e}")))?;
+        let q_emb = embs
+            .pop()
+            .ok_or_else(|| StorageError::Other("embedder returned no vectors".into()))?;
+        let vec_query = VectorSearchQuery {
+            embedding: q_emb,
+            tenant_id: query.tenant_id,
+            scope_id: query.scope_id,
+            sources: query.sources.clone(),
+            k: leg_k,
+        };
+        let vec_results = self.storage.search_vector(&vec_query).await?;
+
+        Ok(rrf_fuse(bm_results, vec_results, query.k))
     }
 
     pub async fn reset(&self, tenant_id: TenantId) -> StorageResult<()> {
@@ -304,6 +386,81 @@ impl<S: Storage> MemoryController<S> {
         self.storage
             .invalidate_reflective(reflective_id, t_invalid)
             .await
+    }
+}
+
+/// Best-effort text extraction from an event payload for embedding. Matches
+/// the renderer InMemoryStorage uses for BM25, so both retrieval legs
+/// operate on the same surface text.
+fn render_content(payload: &Value) -> String {
+    if let Some(s) = payload.get("content").and_then(|v| v.as_str()) {
+        s.to_string()
+    } else {
+        payload.to_string()
+    }
+}
+
+/// Reciprocal Rank Fusion (Cormack, Clarke, Büttcher 2009) over two ranked
+/// lists. Per-list score is `1 / (K_RRF + rank)`, summed across lists.
+/// `K_RRF = 60` is the standard value — small enough that early ranks
+/// dominate, large enough to not be brittle to single-rank perturbations.
+///
+/// Content/metadata for the output is taken from whichever leg's payload
+/// appears first; both legs return identical-shape `SearchResult`s so this
+/// is sound.
+fn rrf_fuse(
+    bm: Vec<SearchResult>,
+    vec: Vec<SearchResult>,
+    top: usize,
+) -> Vec<SearchResult> {
+    const K_RRF: f32 = 60.0;
+    use std::collections::HashMap;
+
+    let mut scores: HashMap<EventId, f32> = HashMap::new();
+    let mut payloads: HashMap<EventId, SearchResult> = HashMap::new();
+
+    for (rank, mut r) in bm.into_iter().enumerate() {
+        let s = 1.0 / (K_RRF + (rank as f32) + 1.0);
+        *scores.entry(r.event_id).or_insert(0.0) += s;
+        r.metadata = annotate_leg(r.metadata, "bm25");
+        payloads.entry(r.event_id).or_insert(r);
+    }
+    for (rank, mut r) in vec.into_iter().enumerate() {
+        let s = 1.0 / (K_RRF + (rank as f32) + 1.0);
+        *scores.entry(r.event_id).or_insert(0.0) += s;
+        r.metadata = annotate_leg(r.metadata, "vector");
+        payloads.entry(r.event_id).or_insert(r);
+    }
+
+    let mut ordered: Vec<(EventId, f32)> = scores.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Stable tiebreak: smaller event_id wins. Ensures byte-identical
+            // search results across runs for prompt-cache hits downstream.
+            .then(a.0.0.cmp(&b.0.0))
+    });
+
+    ordered
+        .into_iter()
+        .take(top)
+        .filter_map(|(id, fused_score)| {
+            payloads.remove(&id).map(|mut r| {
+                r.score = fused_score;
+                r
+            })
+        })
+        .collect()
+}
+
+fn annotate_leg(meta: Value, leg: &str) -> Value {
+    match meta {
+        Value::Object(mut m) => {
+            // Preserve first-leg attribution: if "leg" is already set, keep it.
+            m.entry("leg".to_string()).or_insert(Value::String(leg.into()));
+            Value::Object(m)
+        }
+        other => other,
     }
 }
 
@@ -1124,6 +1281,176 @@ mod tests {
         ctrl.invalidate_reflection(r.reflective_id, t(2026, 5, 14))
             .await
             .unwrap();
+    }
+
+    // --- Standard-mode retrieval (BM25 + vector + RRF) ---
+
+    use crate::embedder::DeterministicEmbedder;
+    use crate::search::SearchMode;
+
+    fn ctrl_with_embedder() -> MemoryController<InMemoryStorage> {
+        MemoryController::new(InMemoryStorage::new(), InstallKey::generate())
+            .with_embedder(Arc::new(DeterministicEmbedder::new()))
+    }
+
+    #[tokio::test]
+    async fn write_with_embedder_indexes_vector() {
+        let ctrl = ctrl_with_embedder();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let _ = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "hello world"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        // Vector search for the same words must return the event.
+        let emb = DeterministicEmbedder::new();
+        let q = emb.embed(&["hello world".into()]).await.unwrap();
+        let vq = VectorSearchQuery {
+            embedding: q.into_iter().next().unwrap(),
+            tenant_id: tenant,
+            scope_id: None,
+            sources: None,
+            k: 10,
+        };
+        let r = ctrl.storage.search_vector(&vq).await.unwrap();
+        assert_eq!(r.len(), 1);
+        // Self-similarity ≈ 1.
+        assert!(r[0].score > 0.99, "expected ≈1.0 self-similarity, got {}", r[0].score);
+    }
+
+    #[tokio::test]
+    async fn write_without_embedder_does_not_index_vector() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let _ = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "no vector for me"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        let emb = DeterministicEmbedder::new();
+        let q = emb.embed(&["no vector for me".into()]).await.unwrap();
+        let vq = VectorSearchQuery {
+            embedding: q.into_iter().next().unwrap(),
+            tenant_id: tenant,
+            scope_id: None,
+            sources: None,
+            k: 10,
+        };
+        let r = ctrl.storage.search_vector(&vq).await.unwrap();
+        assert_eq!(r.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn standard_mode_runs_rrf_fusion_when_embedder_set() {
+        let ctrl = ctrl_with_embedder();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        // Two events. The first BM25-matches the query; the second
+        // vector-matches via the hash-projection embedder. RRF should
+        // surface BOTH.
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha beta gamma"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut q = SearchQuery::new("alpha", tenant);
+        q.mode = SearchMode::Standard;
+        let results = ctrl.search(&q).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cheap_mode_skips_vector_even_when_embedder_set() {
+        let ctrl = ctrl_with_embedder();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut q = SearchQuery::new("alpha", tenant);
+        q.mode = SearchMode::Cheap;
+        let results = ctrl.search(&q).await.unwrap();
+        assert_eq!(results.len(), 1);
+        // The "leg" metadata should NOT be present in Cheap mode — the BM25
+        // path returns its result without RRF annotation.
+        assert!(results[0].metadata.get("leg").is_none());
+    }
+
+    #[test]
+    fn rrf_fuse_sums_per_list_reciprocal_ranks() {
+        use ditto_core::EventId;
+        let mk = |id_byte: u8, score: f32| SearchResult {
+            event_id: EventId([id_byte; 32]),
+            content: format!("doc-{id_byte}"),
+            score,
+            source_event_ids: vec![],
+            metadata: serde_json::json!({}),
+        };
+        // Document 1 is rank 0 in BM and rank 0 in vector → biggest fused score.
+        // Document 2 is rank 1 in BM only.
+        // Document 3 is rank 1 in vector only.
+        let bm = vec![mk(1, 0.9), mk(2, 0.5)];
+        let vec = vec![mk(1, 0.95), mk(3, 0.6)];
+        let out = rrf_fuse(bm, vec, 3);
+        assert_eq!(out.len(), 3);
+        // doc 1 must be first.
+        assert_eq!(out[0].event_id, EventId([1; 32]));
+        // doc 1's fused score = 2/(60+1) ≈ 0.0328
+        assert!((out[0].score - 2.0 / 61.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_fuse_breaks_ties_by_event_id() {
+        use ditto_core::EventId;
+        let mk = |id_byte: u8| SearchResult {
+            event_id: EventId([id_byte; 32]),
+            content: "x".into(),
+            score: 0.0,
+            source_event_ids: vec![],
+            metadata: serde_json::json!({}),
+        };
+        // Both documents only show up once at rank 0 in different legs —
+        // same fused score. Smaller event_id wins by tiebreak.
+        let bm = vec![mk(2)];
+        let vec = vec![mk(1)];
+        let out = rrf_fuse(bm, vec, 2);
+        assert_eq!(out[0].event_id, EventId([1; 32]));
     }
 
     #[tokio::test]

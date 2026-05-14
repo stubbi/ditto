@@ -20,7 +20,7 @@ use ditto_core::{
     NodeId, Receipt, Reflective, ReflectiveId, ScopeId, SchemaVersion, Signature, Skill, SkillId,
     SkillStatus, Slot, SupersedePolicy, TenantId,
 };
-use ditto_memory::search::{SearchQuery, SearchResult};
+use ditto_memory::search::{SearchQuery, SearchResult, VectorSearchQuery};
 use ditto_memory::storage::{Storage, StorageError, StorageResult};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -911,6 +911,114 @@ impl Storage for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn put_embedding(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        embedding: &[f32],
+    ) -> StorageResult<()> {
+        // pgvector binds via its `Vec<f32>` text-form `[1.0, 2.0, ...]` — we
+        // serialize once here rather than depending on the pgvector crate so
+        // a follow-up swap to sqlx-native vector binding is a one-file change.
+        let vector_lit = embedding_to_pg_literal(embedding);
+        let n = sqlx::query(
+            r#"UPDATE episodic
+               SET embedding = $3::vector
+               WHERE tenant_id = $1 AND event_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&event_id.0[..])
+        .bind(vector_lit)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("put_embedding: {e}")))?;
+        if n.rows_affected() == 0 {
+            return Err(StorageError::Other(format!(
+                "no episodic row to attach embedding to: {event_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {
+        let vector_lit = embedding_to_pg_literal(&query.embedding);
+        let sources = query.sources.as_deref().map(|s| s.to_vec());
+        let rows = sqlx::query(
+            r#"SELECT event_id, content, ts, source_id, slot,
+                      1 - (embedding <=> $2::vector) AS similarity
+               FROM episodic
+               WHERE tenant_id = $1
+                 AND embedding IS NOT NULL
+                 AND ($3::uuid IS NULL OR scope_id = $3)
+                 AND ($4::text[] IS NULL OR source_id = ANY($4))
+               ORDER BY embedding <=> $2::vector
+               LIMIT $5"#,
+        )
+        .bind(query.tenant_id.0)
+        .bind(vector_lit)
+        .bind(query.scope_id.map(|s| s.0))
+        .bind(sources)
+        .bind(query.k as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("search_vector: {e}")))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let event_id_bytes: Vec<u8> = row
+                    .try_get("event_id")
+                    .map_err(|e| StorageError::Other(format!("event_id col: {e}")))?;
+                let event_id = EventId::from_hex(&hex_lower(&event_id_bytes))
+                    .map_err(|e| StorageError::Other(format!("event_id decode: {e}")))?;
+                let content: Option<String> = row
+                    .try_get("content")
+                    .map_err(|e| StorageError::Other(format!("content col: {e}")))?;
+                let ts: DateTime<Utc> = row
+                    .try_get("ts")
+                    .map_err(|e| StorageError::Other(format!("ts col: {e}")))?;
+                let source_id: String = row
+                    .try_get("source_id")
+                    .map_err(|e| StorageError::Other(format!("source_id col: {e}")))?;
+                let slot: String = row
+                    .try_get("slot")
+                    .map_err(|e| StorageError::Other(format!("slot col: {e}")))?;
+                let similarity: f64 = row
+                    .try_get("similarity")
+                    .map_err(|e| StorageError::Other(format!("similarity col: {e}")))?;
+                Ok(SearchResult {
+                    event_id,
+                    content: content.unwrap_or_default(),
+                    score: similarity as f32,
+                    source_event_ids: vec![event_id],
+                    metadata: serde_json::json!({
+                        "source_id": source_id,
+                        "timestamp": ts,
+                        "slot": slot,
+                        "leg": "vector",
+                    }),
+                })
+            })
+            .collect()
+    }
+}
+
+fn embedding_to_pg_literal(v: &[f32]) -> String {
+    // pgvector text format: `[1,2,3,...]`. No spaces required. We use the
+    // text format because it avoids depending on a pgvector-specific sqlx
+    // adapter; binding the literal as `text` and casting to `vector` on the
+    // server side is supported and idiomatic.
+    let mut out = String::with_capacity(v.len() * 8 + 2);
+    out.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // R-style minimal float — `1`, `0.5`, `-1.25`. avoid `1e0`.
+        out.push_str(&format!("{x}"));
+    }
+    out.push(']');
+    out
 }
 
 fn payload_content(payload: &Value) -> String {

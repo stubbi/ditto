@@ -53,3 +53,15 @@ pub struct SearchResult {
     pub source_event_ids: Vec<EventId>,
     pub metadata: serde_json::Value,
 }
+
+/// A dense-vector retrieval request. Distinct from `SearchQuery` because the
+/// caller has already done the embedding work; storage backends only need to
+/// know the vector + filters, not the original text.
+#[derive(Clone, Debug)]
+pub struct VectorSearchQuery {
+    pub embedding: Vec<f32>,
+    pub tenant_id: TenantId,
+    pub scope_id: Option<ScopeId>,
+    pub sources: Option<Vec<String>>,
+    pub k: usize,
+}

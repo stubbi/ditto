@@ -15,7 +15,7 @@ use ditto_core::{
     NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId, SkillStatus, TenantId,
 };
 
-use crate::search::{SearchQuery, SearchResult};
+use crate::search::{SearchQuery, SearchResult, VectorSearchQuery};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -237,4 +237,22 @@ pub trait Storage: Send + Sync {
         reflective_id: ReflectiveId,
         t_invalid: DateTime<Utc>,
     ) -> StorageResult<()>;
+
+    // --- Dense retrieval ---
+
+    /// Store an embedding vector for an event. Idempotent on `event_id`;
+    /// a second `put_embedding` for the same event overwrites (embedders
+    /// can be swapped without rewriting events).
+    async fn put_embedding(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        embedding: &[f32],
+    ) -> StorageResult<()>;
+
+    /// Vector search. Returns SearchResults shaped identically to `search`
+    /// so RRF fusion in the controller can treat both legs symmetrically.
+    /// `score` is the cosine similarity in [-1.0, 1.0]; backends that
+    /// compute distance instead must convert (1 - distance).
+    async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>>;
 }

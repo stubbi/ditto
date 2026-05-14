@@ -22,7 +22,8 @@ use ditto_core::{
     NodeId, Receipt, Reflective, ReflectiveId, ScopeId, Skill, SkillId, SkillStatus, TenantId,
 };
 
-use crate::search::{SearchQuery, SearchResult};
+use crate::embedder::cosine;
+use crate::search::{SearchQuery, SearchResult, VectorSearchQuery};
 use crate::storage::{Storage, StorageError, StorageResult};
 
 #[derive(Default)]
@@ -48,6 +49,9 @@ struct Inner {
     skills: HashMap<(TenantId, SkillId), Skill>,
     /// reflective_id -> Reflective (versioned via bi-temporal cols).
     reflective: HashMap<ReflectiveId, Reflective>,
+    /// (tenant_id, event_id) -> embedding. Tenant-scoped so a tenant reset
+    /// purges its vectors alongside the rest.
+    embeddings: HashMap<(TenantId, EventId), Vec<f32>>,
 }
 
 impl InMemoryStorage {
@@ -145,6 +149,7 @@ impl Storage for InMemoryStorage {
         inner.blobs.retain(|(t, _), _| *t != tenant_id);
         inner.skills.retain(|(t, _), _| *t != tenant_id);
         inner.reflective.retain(|_, r| r.tenant_id != tenant_id);
+        inner.embeddings.retain(|(t, _), _| *t != tenant_id);
         Ok(())
     }
 
@@ -599,6 +604,66 @@ impl Storage for InMemoryStorage {
         }
         r.t_invalid = Some(t_invalid);
         Ok(())
+    }
+
+    async fn put_embedding(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        embedding: &[f32],
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .embeddings
+            .insert((tenant_id, event_id), embedding.to_vec());
+        Ok(())
+    }
+
+    async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {
+        let inner = self.inner.lock().unwrap();
+        let events = match inner.events.get(&query.tenant_id) {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        let mut scored: Vec<(f32, &Event)> = Vec::new();
+        for e in events {
+            if let Some(sources) = &query.sources {
+                if !sources.contains(&e.source_id) {
+                    continue;
+                }
+            }
+            if let Some(scope_id) = query.scope_id {
+                if e.scope_id != scope_id {
+                    continue;
+                }
+            }
+            let Some(emb) = inner.embeddings.get(&(query.tenant_id, e.event_id)) else {
+                continue;
+            };
+            if emb.len() != query.embedding.len() {
+                continue;
+            }
+            let sim = cosine(&query.embedding, emb);
+            scored.push((sim, e));
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let out = scored
+            .into_iter()
+            .take(query.k)
+            .map(|(score, e)| SearchResult {
+                event_id: e.event_id,
+                content: render(e),
+                score,
+                source_event_ids: vec![e.event_id],
+                metadata: json!({
+                    "source_id": e.source_id,
+                    "timestamp": e.timestamp,
+                    "slot": e.slot,
+                    "leg": "vector",
+                }),
+            })
+            .collect();
+        Ok(out)
     }
 }
 
