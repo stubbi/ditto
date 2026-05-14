@@ -103,6 +103,41 @@ pub struct ImportReport {
     pub errors: Vec<String>,
 }
 
+/// The three consolidation cadences. v0 ships Ripple as a deterministic,
+/// in-process implementation. Dream and LongSleep are stubbed — the real
+/// implementations need an LLM extractor (dream) and a background-scheduler
+/// (long sleep), both research-first follow-ups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationMode {
+    /// Between-turn, ≤200ms budget, deterministic. Replays recent episodic
+    /// events against NC-graph nodes via cheap token overlap to decide which
+    /// events to tag for the next dream cycle.
+    Ripple,
+    /// Session-close + 24h. LLM-driven Observer/Reflector pattern. Stubbed
+    /// in v0 — call returns ConsolidationReport with stub=true.
+    Dream,
+    /// Daily/weekly. Decay sweep, retrieval-induced suppression, cold
+    /// subgraph archival, spaced-retrieval self-testing. Stubbed in v0.
+    LongSleep,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConsolidationReport {
+    pub mode: ConsolidationMode,
+    pub tenant_id: TenantId,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub events_examined: u32,
+    pub events_fit: u32,
+    pub events_tagged_for_dream: u32,
+    /// True when this consolidation mode is stubbed in v0 (Dream / LongSleep
+    /// currently). Callers can branch on `stub` to surface "consolidation
+    /// pending — needs LLM extractor" rather than silently ignoring.
+    pub stub: bool,
+    pub notes: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     #[error("event {event_id} is not in the labile window")]
@@ -566,6 +601,122 @@ impl<S: Storage> MemoryController<S> {
         })
     }
 
+    /// Run a consolidation pass.
+    ///
+    /// `Ripple` is the deterministic v0 implementation — no LLM calls. It
+    /// reads recent episodic events, scores schema-fit against NC-graph
+    /// nodes via cheap token overlap (lowercased word-set intersection vs
+    /// each node's `properties` text), and tags events that fit for the
+    /// next (eventual) dream cycle.
+    ///
+    /// `Dream` and `LongSleep` return reports with `stub = true` and notes
+    /// describing what the real implementation will do. Calling code can
+    /// branch on `report.stub` to surface "consolidation pending" rather
+    /// than treating the no-op as a successful pass.
+    pub async fn consolidate(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        mode: ConsolidationMode,
+    ) -> StorageResult<ConsolidationReport> {
+        let started = Utc::now();
+        match mode {
+            ConsolidationMode::Ripple => self.run_ripple(tenant_id, scope_id, started).await,
+            ConsolidationMode::Dream => Ok(ConsolidationReport {
+                mode,
+                tenant_id,
+                started_at: started,
+                finished_at: started,
+                events_examined: 0,
+                events_fit: 0,
+                events_tagged_for_dream: 0,
+                stub: true,
+                notes: "Dream cycle pending — requires LLM Observer/Reflector \
+                        pipeline + Graphiti contradiction check + ADM \
+                        counterfactual verification. Tagged events are \
+                        currently consumed only by the Ripple deterministic \
+                        check; no extraction has happened yet."
+                    .into(),
+            }),
+            ConsolidationMode::LongSleep => Ok(ConsolidationReport {
+                mode,
+                tenant_id,
+                started_at: started,
+                finished_at: started,
+                events_examined: 0,
+                events_fit: 0,
+                events_tagged_for_dream: 0,
+                stub: true,
+                notes: "Long sleep pending — requires background scheduler \
+                        for decay sweep, retrieval-induced suppression, cold \
+                        subgraph archival, and spaced-retrieval self-testing."
+                    .into(),
+            }),
+        }
+    }
+
+    async fn run_ripple(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        started: DateTime<Utc>,
+    ) -> StorageResult<ConsolidationReport> {
+        // v0 fixed budget: examine up to 50 most-recent events. The
+        // architecture's ≤200ms budget needs a wall-clock guard once dream
+        // extraction lands and pulls actual work; for deterministic ripple
+        // the loop is bounded by event count.
+        const MAX_EVENTS: usize = 50;
+        const FIT_THRESHOLD: usize = 2; // ≥N overlap tokens count as schema-fit
+
+        let events = self
+            .storage
+            .list_episodic(tenant_id, scope_id, Some(MAX_EVENTS))
+            .await?;
+        let nodes = self.storage.list_nodes(tenant_id, scope_id).await?;
+
+        // Pre-tokenize node properties once.
+        let node_tokens: Vec<std::collections::HashSet<String>> = nodes
+            .iter()
+            .map(|n| tokenize(&n.properties.to_string()))
+            .collect();
+
+        let mut fit = 0_u32;
+        let mut tagged = 0_u32;
+        for e in &events {
+            let event_tokens = tokenize(&render_content(&e.payload));
+            if event_tokens.is_empty() {
+                continue;
+            }
+            let max_overlap = node_tokens
+                .iter()
+                .map(|nt| event_tokens.intersection(nt).count())
+                .max()
+                .unwrap_or(0);
+            if max_overlap >= FIT_THRESHOLD {
+                fit += 1;
+                tagged += 1;
+            }
+        }
+
+        let finished = Utc::now();
+        Ok(ConsolidationReport {
+            mode: ConsolidationMode::Ripple,
+            tenant_id,
+            started_at: started,
+            finished_at: finished,
+            events_examined: events.len() as u32,
+            events_fit: fit,
+            events_tagged_for_dream: tagged,
+            stub: false,
+            notes: format!(
+                "Examined {} events against {} nodes; fit threshold = {} overlapping tokens.",
+                events.len(),
+                nodes.len(),
+                FIT_THRESHOLD
+            ),
+        })
+    }
+
     /// Stream a tenant's episodic events as JSONL into `writer`. One event
     /// per line; the wire shape is the `Event` serde representation, so
     /// `import_episodic_jsonl` round-trips losslessly.
@@ -916,6 +1067,18 @@ impl<S: Storage> MemoryController<S> {
             .invalidate_reflective(reflective_id, t_invalid)
             .await
     }
+}
+
+/// Lowercased alphanumeric token set; used by the deterministic ripple
+/// schema-fit check. Stopword-free intentionally — small node-property
+/// payloads benefit from picking up "is" / "are" overlaps until we learn
+/// otherwise.
+fn tokenize(s: &str) -> std::collections::HashSet<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && t.len() > 1)
+        .map(String::from)
+        .collect()
 }
 
 /// Best-effort text extraction from an event payload for embedding. Matches
@@ -2133,6 +2296,99 @@ mod tests {
             .update(tenant, r.event_id, json!({"content": "v3"}), Authority::User)
             .await;
         assert!(matches!(err, Err(UpdateError::AlreadyShadowed { .. })));
+    }
+
+    // --- Consolidation ---
+
+    #[tokio::test]
+    async fn ripple_scores_event_with_node_overlap_as_fit() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        // Node has "berlin" and "germany" in its properties.
+        let n = NodeId::new();
+        ctrl.assert_node(NewNode {
+            node_id: n,
+            tenant_id: tenant,
+            scope_id: scope,
+            node_type: "location".into(),
+            properties: json!({"city": "Berlin", "country": "Germany"}),
+            provenance: vec![],
+        })
+        .await
+        .unwrap();
+        // This event mentions both — token overlap ≥ 2 → fit.
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "user is moving from Berlin to Germany"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        // This event has zero overlap with any node — not fit.
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "unrelated chatter about kittens"}),
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let report = ctrl
+            .consolidate(tenant, None, ConsolidationMode::Ripple)
+            .await
+            .unwrap();
+        assert!(!report.stub);
+        assert_eq!(report.mode, ConsolidationMode::Ripple);
+        assert_eq!(report.events_examined, 2);
+        assert_eq!(report.events_fit, 1);
+        assert_eq!(report.events_tagged_for_dream, 1);
+    }
+
+    #[tokio::test]
+    async fn ripple_with_no_nodes_returns_zero_fit() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "lonely event in an empty graph"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let report = ctrl
+            .consolidate(tenant, None, ConsolidationMode::Ripple)
+            .await
+            .unwrap();
+        assert_eq!(report.events_fit, 0);
+    }
+
+    #[tokio::test]
+    async fn dream_and_long_sleep_return_stub_reports() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let dream = ctrl
+            .consolidate(tenant, None, ConsolidationMode::Dream)
+            .await
+            .unwrap();
+        assert!(dream.stub);
+        assert!(dream.notes.to_lowercase().contains("dream"));
+        let long = ctrl
+            .consolidate(tenant, None, ConsolidationMode::LongSleep)
+            .await
+            .unwrap();
+        assert!(long.stub);
+        assert!(long.notes.to_lowercase().contains("long sleep"));
     }
 
     // --- Explain / export / import ---

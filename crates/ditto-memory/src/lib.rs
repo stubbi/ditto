@@ -18,7 +18,8 @@ pub mod storage;
 pub mod working;
 
 pub use controller::{
-    Authority, DeletionProof, DeletionTarget, ImportReport, MemoryController, UpdateError,
+    Authority, ConsolidationMode, ConsolidationReport, DeletionProof, DeletionTarget,
+    ImportReport, MemoryController, UpdateError,
 };
 pub use embedder::{cosine, DeterministicEmbedder, Embedder, EmbedderError, EMBEDDING_DIM};
 pub use in_memory::InMemoryStorage;
