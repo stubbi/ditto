@@ -214,6 +214,11 @@ pub struct MemoryController<S: Storage> {
     /// operates on a clean top-K rather than a noisy candidate pool.
     /// `None` defaults to no rerank (identity).
     reranker: Option<Arc<dyn Reranker>>,
+    /// Over-retrieval factor for the reranker. When a reranker is set,
+    /// `search` widens the candidate pool to `k * factor` before
+    /// reranking, then truncates back to `k`. Ignored when no
+    /// reranker is configured. Default 3.
+    rerank_pool_factor: usize,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -256,6 +261,7 @@ impl<S: Storage> MemoryController<S> {
             dream_extract_concurrency: 8,
             long_sleep_decay: 0.95,
             reranker: None,
+            rerank_pool_factor: 3,
         }
     }
 
@@ -352,6 +358,19 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn reranker(&self) -> Option<&Arc<dyn Reranker>> {
         self.reranker.as_ref()
+    }
+
+    /// Over-retrieval factor for the reranker. With `factor=3`, a
+    /// `k=10` search internally retrieves 30 candidates, lets the
+    /// reranker reorder them, then truncates to 10. Setting `factor=1`
+    /// disables over-retrieval. Clamped to 1+. Default 3.
+    pub fn with_rerank_pool_factor(mut self, factor: usize) -> Self {
+        self.rerank_pool_factor = factor.max(1);
+        self
+    }
+
+    pub fn rerank_pool_factor(&self) -> usize {
+        self.rerank_pool_factor
     }
 
     pub fn with_labile_window(mut self, duration: Duration) -> Self {
@@ -488,14 +507,32 @@ impl<S: Storage> MemoryController<S> {
     /// can rewrite the trace. After the window closes the event is treated
     /// as consolidated and only `invalidate_edge` / `delete` paths apply.
     pub async fn search(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
-        let raw = self.run_retrieval(query).await?;
+        // When a reranker is configured, over-retrieve so it has more
+        // candidates to choose from. The reranker can only reorder what
+        // retrieval surfaces — if the right doc is at rank 15 in a
+        // k=10 search, no amount of reranking helps. We pull
+        // `rerank_pool_factor * k` candidates internally, hand them to
+        // the reranker, then truncate to `k` after.
+        let pool_query = if self.reranker.is_some() && self.rerank_pool_factor > 1 {
+            let mut q = query.clone();
+            q.k = q.k.saturating_mul(self.rerank_pool_factor).max(query.k);
+            q
+        } else {
+            query.clone()
+        };
+
+        let raw = self.run_retrieval(&pool_query).await?;
         let resolved = self.resolve_shadows(query.tenant_id, raw).await?;
         let gated = self.apply_recency_blend(self.apply_relevance_gate(resolved));
-        let reranked = if let Some(reranker) = self.reranker.as_ref() {
+        let mut reranked = if let Some(reranker) = self.reranker.as_ref() {
             reranker.rerank(&query.query, gated).await
         } else {
             gated
         };
+        // Truncate to the caller's requested k after rerank.
+        if reranked.len() > query.k {
+            reranked.truncate(query.k);
+        }
 
         // Open the labile window on every returned event.
         let now = Utc::now();
