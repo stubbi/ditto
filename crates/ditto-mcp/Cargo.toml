@@ -1,0 +1,23 @@
+[package]
+name = "ditto-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server transport for Ditto. Exposes the memory controller's tools over stdio MCP, consumable from Claude Code, Cursor, Zed, and any MCP client."
+
+[dependencies]
+ditto-core = { workspace = true }
+ditto-memory = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
