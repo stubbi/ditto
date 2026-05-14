@@ -16,4 +16,7 @@ pub enum Error {
 
     #[error("serde_json: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("{0}")]
+    Other(String),
 }

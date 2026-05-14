@@ -21,8 +21,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, Node, NodeId,
-    Receipt, ScopeId, SchemaVersion, Slot, TenantId, CURRENT_SCHEMA_VERSION,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, NewSkill, Node,
+    NodeId, Receipt, ScopeId, SchemaVersion, Skill, SkillId, SkillStatus, Slot, TenantId,
+    CURRENT_SCHEMA_VERSION,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -208,6 +209,59 @@ impl<S: Storage> MemoryController<S> {
 
     pub async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
         self.storage.has_blob(tenant_id, hash).await
+    }
+
+    // --- Procedural (skills) ---
+
+    pub async fn register_skill(&self, skill: NewSkill) -> StorageResult<Skill> {
+        self.storage.register_skill(skill).await
+    }
+
+    pub async fn get_skill(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+    ) -> StorageResult<Option<Skill>> {
+        self.storage.get_skill(tenant_id, skill_id).await
+    }
+
+    pub async fn list_skills(
+        &self,
+        tenant_id: TenantId,
+        status_filter: Option<SkillStatus>,
+    ) -> StorageResult<Vec<Skill>> {
+        self.storage.list_skills(tenant_id, status_filter).await
+    }
+
+    pub async fn mark_skill_used(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        self.storage.mark_skill_used(tenant_id, skill_id, at).await
+    }
+
+    pub async fn set_skill_tests_pass(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        pass: f32,
+    ) -> StorageResult<()> {
+        self.storage
+            .set_skill_tests_pass(tenant_id, skill_id, pass)
+            .await
+    }
+
+    pub async fn set_skill_status(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        status: SkillStatus,
+    ) -> StorageResult<()> {
+        self.storage
+            .set_skill_status(tenant_id, skill_id, status)
+            .await
     }
 }
 
@@ -751,5 +805,167 @@ mod tests {
         assert!(ctrl.has_blob(tenant, h).await.unwrap());
         ctrl.reset(tenant).await.unwrap();
         assert!(!ctrl.has_blob(tenant, h).await.unwrap());
+    }
+
+    // --- Procedural ---
+
+    fn new_skill(tenant: TenantId, scope: ScopeId, id: &str) -> NewSkill {
+        NewSkill {
+            skill_id: SkillId::new(id),
+            tenant_id: tenant,
+            scope_id: scope,
+            version: "1.0.0".into(),
+            path: format!("skills/{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_skill_returns_active_record() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let s = ctrl
+            .register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        assert_eq!(s.status, SkillStatus::Active);
+        assert!(s.last_used.is_none());
+        assert!(s.tests_pass.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_skill_is_idempotent_on_same_version() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let a = ctrl
+            .register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        let b = ctrl
+            .register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn register_skill_rejects_version_collision() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        let mut conflict = new_skill(tenant, scope, "deploy");
+        conflict.version = "2.0.0".into();
+        assert!(ctrl.register_skill(conflict).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transitions_round_trip() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let s = ctrl
+            .register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        ctrl.set_skill_status(tenant, &s.skill_id, SkillStatus::Deprecated)
+            .await
+            .unwrap();
+        let after_dep = ctrl.get_skill(tenant, &s.skill_id).await.unwrap().unwrap();
+        assert_eq!(after_dep.status, SkillStatus::Deprecated);
+        ctrl.set_skill_status(tenant, &s.skill_id, SkillStatus::Archived)
+            .await
+            .unwrap();
+        let after_arch = ctrl.get_skill(tenant, &s.skill_id).await.unwrap().unwrap();
+        assert_eq!(after_arch.status, SkillStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn list_skills_filters_by_status() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.register_skill(new_skill(tenant, scope, "a"))
+            .await
+            .unwrap();
+        let b = ctrl
+            .register_skill(new_skill(tenant, scope, "b"))
+            .await
+            .unwrap();
+        ctrl.set_skill_status(tenant, &b.skill_id, SkillStatus::Deprecated)
+            .await
+            .unwrap();
+        let active = ctrl
+            .list_skills(tenant, Some(SkillStatus::Active))
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].skill_id.as_str(), "a");
+        let dep = ctrl
+            .list_skills(tenant, Some(SkillStatus::Deprecated))
+            .await
+            .unwrap();
+        assert_eq!(dep.len(), 1);
+        let all = ctrl.list_skills(tenant, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mark_used_and_set_tests_pass_update_record() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let s = ctrl
+            .register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        let when = t(2026, 5, 14);
+        ctrl.mark_skill_used(tenant, &s.skill_id, when)
+            .await
+            .unwrap();
+        ctrl.set_skill_tests_pass(tenant, &s.skill_id, 0.9)
+            .await
+            .unwrap();
+        let got = ctrl.get_skill(tenant, &s.skill_id).await.unwrap().unwrap();
+        assert_eq!(got.last_used, Some(when));
+        assert!((got.tests_pass.unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn set_tests_pass_clamps_out_of_range_inputs() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let s = ctrl
+            .register_skill(new_skill(tenant, scope, "deploy"))
+            .await
+            .unwrap();
+        ctrl.set_skill_tests_pass(tenant, &s.skill_id, 2.0)
+            .await
+            .unwrap();
+        let got = ctrl.get_skill(tenant, &s.skill_id).await.unwrap().unwrap();
+        assert!((got.tests_pass.unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn skills_are_tenant_scoped() {
+        let ctrl = ctrl();
+        let t_a = TenantId::new();
+        let t_b = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.register_skill(new_skill(t_a, scope, "deploy"))
+            .await
+            .unwrap();
+        // tenant_b can register a skill with the same id without conflict.
+        ctrl.register_skill(new_skill(t_b, scope, "deploy"))
+            .await
+            .unwrap();
+        let a_list = ctrl.list_skills(t_a, None).await.unwrap();
+        let b_list = ctrl.list_skills(t_b, None).await.unwrap();
+        assert_eq!(a_list.len(), 1);
+        assert_eq!(b_list.len(), 1);
     }
 }

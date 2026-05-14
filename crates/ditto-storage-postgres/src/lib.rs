@@ -16,8 +16,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId,
-    SchemaVersion, Signature, Slot, SupersedePolicy, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewSkill, Node, NodeId,
+    Receipt, ScopeId, SchemaVersion, Signature, Skill, SkillId, SkillStatus, Slot, SupersedePolicy,
+    TenantId,
 };
 use ditto_memory::search::{SearchQuery, SearchResult};
 use ditto_memory::storage::{Storage, StorageError, StorageResult};
@@ -247,6 +248,11 @@ impl Storage for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Other(format!("reset blob: {e}")))?;
+        sqlx::query("DELETE FROM procedural WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset procedural: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| StorageError::Other(format!("reset commit: {e}")))?;
@@ -613,6 +619,172 @@ impl Storage for PostgresStorage {
         .map_err(|e| StorageError::Other(format!("has_blob: {e}")))?;
         Ok(row.is_some())
     }
+
+    async fn register_skill(&self, skill: NewSkill) -> StorageResult<Skill> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Other(format!("begin: {e}")))?;
+        let existing = sqlx::query(
+            r#"SELECT version, scope_id, path, last_used, tests_pass, status
+               FROM procedural
+               WHERE tenant_id = $1 AND skill_id = $2
+               FOR UPDATE"#,
+        )
+        .bind(skill.tenant_id.0)
+        .bind(&skill.skill_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Other(format!("register_skill lookup: {e}")))?;
+
+        if let Some(row) = existing {
+            let version: String = row
+                .try_get("version")
+                .map_err(|e| StorageError::Other(format!("version col: {e}")))?;
+            if version != skill.version {
+                return Err(StorageError::Other(format!(
+                    "skill {} already registered with version {} (got {})",
+                    skill.skill_id, version, skill.version
+                )));
+            }
+            // Idempotent on identical re-register — return the existing row.
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Other(format!("commit: {e}")))?;
+            return self
+                .get_skill(skill.tenant_id, &skill.skill_id)
+                .await?
+                .ok_or_else(|| StorageError::Other("skill vanished after upsert".into()));
+        }
+
+        sqlx::query(
+            r#"INSERT INTO procedural
+                 (tenant_id, skill_id, scope_id, version, path, last_used, tests_pass, status)
+               VALUES ($1, $2, $3, $4, $5, NULL, NULL, 'active')"#,
+        )
+        .bind(skill.tenant_id.0)
+        .bind(&skill.skill_id.0)
+        .bind(skill.scope_id.0)
+        .bind(&skill.version)
+        .bind(&skill.path)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Other(format!("register_skill insert: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Other(format!("commit: {e}")))?;
+
+        self.get_skill(skill.tenant_id, &skill.skill_id)
+            .await?
+            .ok_or_else(|| StorageError::Other("skill vanished after insert".into()))
+    }
+
+    async fn get_skill(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+    ) -> StorageResult<Option<Skill>> {
+        let row = sqlx::query(
+            r#"SELECT skill_id, scope_id, version, path, last_used, tests_pass, status
+               FROM procedural
+               WHERE tenant_id = $1 AND skill_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&skill_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("get_skill: {e}")))?;
+        row.map(|r| row_to_skill(tenant_id, r)).transpose()
+    }
+
+    async fn list_skills(
+        &self,
+        tenant_id: TenantId,
+        status_filter: Option<SkillStatus>,
+    ) -> StorageResult<Vec<Skill>> {
+        let rows = sqlx::query(
+            r#"SELECT skill_id, scope_id, version, path, last_used, tests_pass, status
+               FROM procedural
+               WHERE tenant_id = $1
+                 AND ($2::text IS NULL OR status = $2)
+               ORDER BY skill_id"#,
+        )
+        .bind(tenant_id.0)
+        .bind(status_filter.map(|s| s.as_str()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("list_skills: {e}")))?;
+        rows.into_iter()
+            .map(|r| row_to_skill(tenant_id, r))
+            .collect()
+    }
+
+    async fn mark_skill_used(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let n = sqlx::query(
+            r#"UPDATE procedural SET last_used = $3
+               WHERE tenant_id = $1 AND skill_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&skill_id.0)
+        .bind(at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("mark_skill_used: {e}")))?;
+        if n.rows_affected() == 0 {
+            return Err(StorageError::Other(format!("skill not found: {skill_id}")));
+        }
+        Ok(())
+    }
+
+    async fn set_skill_tests_pass(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        pass: f32,
+    ) -> StorageResult<()> {
+        let n = sqlx::query(
+            r#"UPDATE procedural SET tests_pass = $3
+               WHERE tenant_id = $1 AND skill_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&skill_id.0)
+        .bind(pass.clamp(0.0, 1.0))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("set_skill_tests_pass: {e}")))?;
+        if n.rows_affected() == 0 {
+            return Err(StorageError::Other(format!("skill not found: {skill_id}")));
+        }
+        Ok(())
+    }
+
+    async fn set_skill_status(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        status: SkillStatus,
+    ) -> StorageResult<()> {
+        let n = sqlx::query(
+            r#"UPDATE procedural SET status = $3
+               WHERE tenant_id = $1 AND skill_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&skill_id.0)
+        .bind(status.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("set_skill_status: {e}")))?;
+        if n.rows_affected() == 0 {
+            return Err(StorageError::Other(format!("skill not found: {skill_id}")));
+        }
+        Ok(())
+    }
 }
 
 fn payload_content(payload: &Value) -> String {
@@ -820,5 +992,42 @@ fn row_to_edge(row: sqlx::postgres::PgRow) -> StorageResult<Edge> {
         t_valid,
         t_invalid,
         provenance,
+    })
+}
+
+fn row_to_skill(tenant_id: TenantId, row: sqlx::postgres::PgRow) -> StorageResult<Skill> {
+    use std::str::FromStr;
+    let skill_id: String = row
+        .try_get("skill_id")
+        .map_err(|e| StorageError::Other(format!("skill_id col: {e}")))?;
+    let scope_id: uuid::Uuid = row
+        .try_get("scope_id")
+        .map_err(|e| StorageError::Other(format!("scope_id col: {e}")))?;
+    let version: String = row
+        .try_get("version")
+        .map_err(|e| StorageError::Other(format!("version col: {e}")))?;
+    let path: String = row
+        .try_get("path")
+        .map_err(|e| StorageError::Other(format!("path col: {e}")))?;
+    let last_used: Option<DateTime<Utc>> = row
+        .try_get("last_used")
+        .map_err(|e| StorageError::Other(format!("last_used col: {e}")))?;
+    let tests_pass: Option<f32> = row
+        .try_get("tests_pass")
+        .map_err(|e| StorageError::Other(format!("tests_pass col: {e}")))?;
+    let status_str: String = row
+        .try_get("status")
+        .map_err(|e| StorageError::Other(format!("status col: {e}")))?;
+    let status = SkillStatus::from_str(&status_str)
+        .map_err(|e| StorageError::Other(format!("status decode: {e}")))?;
+    Ok(Skill {
+        skill_id: SkillId(skill_id),
+        tenant_id,
+        scope_id: ScopeId(scope_id),
+        version,
+        path,
+        last_used,
+        tests_pass,
+        status,
     })
 }

@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt,
-    ScopeId, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewSkill, Node, NodeId,
+    Receipt, ScopeId, Skill, SkillId, SkillStatus, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -44,6 +44,8 @@ struct Inner {
     /// tenants are stored twice so deletes can't leak across the isolation
     /// boundary.
     blobs: HashMap<(TenantId, BlobHash), Blob>,
+    /// (tenant_id, skill_id) -> Skill. Procedural index.
+    skills: HashMap<(TenantId, SkillId), Skill>,
 }
 
 impl InMemoryStorage {
@@ -139,6 +141,7 @@ impl Storage for InMemoryStorage {
         inner.nodes.retain(|_, n| n.tenant_id != tenant_id);
         inner.edges.retain(|_, e| e.tenant_id != tenant_id);
         inner.blobs.retain(|(t, _), _| *t != tenant_id);
+        inner.skills.retain(|(t, _), _| *t != tenant_id);
         Ok(())
     }
 
@@ -399,6 +402,103 @@ impl Storage for InMemoryStorage {
     async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.blobs.contains_key(&(tenant_id, hash)))
+    }
+
+    async fn register_skill(&self, skill: NewSkill) -> StorageResult<Skill> {
+        let key = (skill.tenant_id, skill.skill_id.clone());
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.skills.get(&key) {
+            if existing.version == skill.version {
+                return Ok(existing.clone());
+            }
+            return Err(StorageError::Other(format!(
+                "skill {} already registered with version {} (got {})",
+                skill.skill_id, existing.version, skill.version
+            )));
+        }
+        let record = Skill {
+            skill_id: skill.skill_id,
+            tenant_id: skill.tenant_id,
+            scope_id: skill.scope_id,
+            version: skill.version,
+            path: skill.path,
+            last_used: None,
+            tests_pass: None,
+            status: SkillStatus::Active,
+        };
+        inner.skills.insert(key, record.clone());
+        Ok(record)
+    }
+
+    async fn get_skill(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+    ) -> StorageResult<Option<Skill>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.skills.get(&(tenant_id, skill_id.clone())).cloned())
+    }
+
+    async fn list_skills(
+        &self,
+        tenant_id: TenantId,
+        status_filter: Option<SkillStatus>,
+    ) -> StorageResult<Vec<Skill>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<Skill> = inner
+            .skills
+            .iter()
+            .filter(|((t, _), _)| *t == tenant_id)
+            .filter(|(_, s)| status_filter.is_none_or(|sf| s.status == sf))
+            .map(|(_, s)| s.clone())
+            .collect();
+        out.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+        Ok(out)
+    }
+
+    async fn mark_skill_used(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let skill = inner
+            .skills
+            .get_mut(&(tenant_id, skill_id.clone()))
+            .ok_or_else(|| StorageError::Other(format!("skill not found: {skill_id}")))?;
+        skill.last_used = Some(at);
+        Ok(())
+    }
+
+    async fn set_skill_tests_pass(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        pass: f32,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let skill = inner
+            .skills
+            .get_mut(&(tenant_id, skill_id.clone()))
+            .ok_or_else(|| StorageError::Other(format!("skill not found: {skill_id}")))?;
+        skill.tests_pass = Some(pass.clamp(0.0, 1.0));
+        Ok(())
+    }
+
+    async fn set_skill_status(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        status: SkillStatus,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let skill = inner
+            .skills
+            .get_mut(&(tenant_id, skill_id.clone()))
+            .ok_or_else(|| StorageError::Other(format!("skill not found: {skill_id}")))?;
+        skill.status = status;
+        Ok(())
     }
 }
 

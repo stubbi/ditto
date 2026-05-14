@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use ditto_core::{
-    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt,
-    ScopeId, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, NewSkill, Node, NodeId,
+    Receipt, ScopeId, Skill, SkillId, SkillStatus, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -152,4 +152,53 @@ pub trait Storage: Send + Sync {
     /// Cheap existence check. Avoids a payload read when the caller only
     /// needs to know whether to write.
     async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool>;
+
+    // --- Procedural (skills) ---
+
+    /// Register a skill. Idempotent on `(tenant_id, skill_id)` when the
+    /// `version` matches the existing row; errors if a different version is
+    /// registered under the same id (use `update_skill_version` to migrate).
+    /// New skills land with `status = active`, `last_used = None`,
+    /// `tests_pass = None`.
+    async fn register_skill(&self, skill: NewSkill) -> StorageResult<Skill>;
+
+    async fn get_skill(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+    ) -> StorageResult<Option<Skill>>;
+
+    /// List skills for a tenant. `status_filter = Some(s)` restricts the
+    /// result; `None` returns every row regardless of lifecycle stage.
+    async fn list_skills(
+        &self,
+        tenant_id: TenantId,
+        status_filter: Option<SkillStatus>,
+    ) -> StorageResult<Vec<Skill>>;
+
+    /// Bump `last_used`. Metabolism rules consult this to decide deprecation
+    /// in the dream cycle.
+    async fn mark_skill_used(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        at: DateTime<Utc>,
+    ) -> StorageResult<()>;
+
+    /// Record a test-pass rate in [0.0, 1.0]. Out-of-range values are clamped.
+    async fn set_skill_tests_pass(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        pass: f32,
+    ) -> StorageResult<()>;
+
+    /// Transition lifecycle state: active → deprecated → archived. Backwards
+    /// transitions are allowed (a deprecated skill can be reactivated).
+    async fn set_skill_status(
+        &self,
+        tenant_id: TenantId,
+        skill_id: &SkillId,
+        status: SkillStatus,
+    ) -> StorageResult<()>;
 }

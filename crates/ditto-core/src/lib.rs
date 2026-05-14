@@ -14,6 +14,7 @@ pub mod error;
 pub mod graph;
 pub mod id;
 pub mod signing;
+pub mod skill;
 pub mod types;
 
 pub use blob::{Blob, BlobHash};
@@ -21,6 +22,7 @@ pub use error::Error;
 pub use graph::{Edge, EdgeId, NewEdge, NewNode, Node, NodeId, SupersedePolicy};
 pub use id::{EventId, ScopeId, TenantId};
 pub use signing::{InstallKey, Signature, VerifyingKey};
+pub use skill::{NewSkill, Skill, SkillId, SkillStatus};
 pub use types::{Event, Receipt, SchemaVersion, Slot};
 
 /// The schema version emitted by this crate. Increment when the canonical
