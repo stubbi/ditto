@@ -10,6 +10,7 @@
 //! content-addressed event_id, (b) emits a signed receipt, (c) hands off to
 //! storage in a single transaction.
 
+pub mod contradiction;
 pub mod controller;
 pub mod embedder;
 pub mod extractor;
@@ -23,6 +24,9 @@ pub mod search;
 pub mod storage;
 pub mod working;
 
+pub use contradiction::{
+    ContradictionResolver, HeuristicContradictionResolver, NoopContradictionResolver,
+};
 pub use controller::{
     Authority, ConsolidationMode, ConsolidationReport, DeletionProof, DeletionTarget,
     ImportReport, MemoryController, UpdateError,

@@ -132,11 +132,15 @@ class LocomoConfig:
 
 
 QA_SYSTEM = (
-    "You are a careful question-answering assistant. Given retrieved "
-    "memory fragments from a multi-session conversation between two "
-    "people, answer the user's question. Use ONLY the provided context. "
-    "If the context is insufficient, answer 'No information'. Keep your "
-    "answer concise — a single short phrase or sentence."
+    "You answer questions about a multi-session conversation between "
+    "two people, using retrieved memory fragments as your only source. "
+    "Give your best concise answer (single phrase or short sentence) "
+    "based on what the context says or strongly implies. Do NOT refuse "
+    "or say 'No information' unless the context is *completely* "
+    "unrelated to the question — partial / indirect evidence is enough "
+    "to attempt an answer. For 'when did X' questions, extract the "
+    "specific date or relative time mentioned in the context (e.g. "
+    "'yesterday', 'last month', '8 May 2023')."
 )
 
 JUDGE_SYSTEM = (
