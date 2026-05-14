@@ -15,6 +15,7 @@ pub mod embedder;
 pub mod extractor;
 pub mod in_memory;
 pub mod long_sleep;
+pub mod policy;
 pub mod search;
 pub mod storage;
 pub mod working;
@@ -27,6 +28,7 @@ pub use embedder::{cosine, DeterministicEmbedder, Embedder, EmbedderError, EMBED
 pub use extractor::{name_to_node_id, Extraction, Extractor, NoopExtractor, ProposedFact, RuleExtractor};
 pub use in_memory::InMemoryStorage;
 pub use long_sleep::{LongSleepConfig, LongSleepScheduler, LongSleepTick};
+pub use policy::{HeuristicPolicy, Operation, Policy, PolicyContext, RefusePolicy};
 pub use search::{
     RejectedCandidate, SearchExplained, SearchMode, SearchQuery, SearchResult, VectorSearchQuery,
     WhyRetrieved,
