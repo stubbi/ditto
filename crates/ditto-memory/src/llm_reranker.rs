@@ -149,30 +149,32 @@ impl Reranker for LlmReranker {
         }
         match self.call(query, &results).await {
             Ok(order) => {
-                // Validate the LLM's order: every index in-range, no
-                // duplicates, length matches. If anything's off, fall back
-                // to the input order — better to ship a noisy rerank than
-                // an empty / out-of-order list.
+                // Permissive validator. The LLM commonly drops a few
+                // candidates (it considers them "obviously irrelevant"
+                // and omits rather than tail-sorts) and very rarely
+                // duplicates an index. We treat the LLM's partial
+                // order as authoritative for the indices it DID
+                // include, then append any missing indices in their
+                // original order at the end. Duplicates are dropped.
+                // Out-of-range indices are skipped.
                 let n = results.len();
                 let mut seen = vec![false; n];
-                let mut valid = order.len() == n;
+                let mut ordered_idx: Vec<usize> = Vec::with_capacity(n);
                 for &i in &order {
                     if i >= n || seen[i] {
-                        valid = false;
-                        break;
+                        continue;
                     }
                     seen[i] = true;
+                    ordered_idx.push(i);
                 }
-                if !valid {
-                    tracing::warn!(
-                        order = ?order,
-                        "LlmReranker produced invalid order; falling back to input"
-                    );
-                    return results;
+                for i in 0..n {
+                    if !seen[i] {
+                        ordered_idx.push(i);
+                    }
                 }
                 let mut out: Vec<Option<SearchResult>> =
                     results.into_iter().map(Some).collect();
-                order
+                ordered_idx
                     .into_iter()
                     .map(|i| out[i].take().expect("validated above"))
                     .collect()
