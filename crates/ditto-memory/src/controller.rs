@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -38,6 +39,51 @@ pub enum SigningPolicy {
     Skip,
 }
 
+/// Trust level of the caller asking for an update.
+///
+/// The reconsolidation-window mechanism only allows updates from trusted
+/// sources during the labile window. This is the prompt-injection mitigation
+/// the architecture calls for: a model's own continuation cannot rewrite
+/// memory it just recalled, even if its output happens to include text that
+/// looks like a `memory.update` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    /// User-supplied input — text the user typed or spoke. Trusted.
+    User,
+    /// Output of a tool whose result was signed by a verifying key the
+    /// controller recognises. Trusted.
+    VerifiedTool,
+    /// Explicit system-administrator update. Trusted.
+    SystemAdmin,
+    /// Agent's own reasoning or downstream LLM continuation. Untrusted —
+    /// updates from this authority during the labile window are rejected.
+    AgentContinuation,
+}
+
+impl Authority {
+    pub fn is_trusted(self) -> bool {
+        match self {
+            Authority::User | Authority::VerifiedTool | Authority::SystemAdmin => true,
+            Authority::AgentContinuation => false,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    #[error("event {event_id} is not in the labile window")]
+    NotLabile { event_id: EventId },
+    #[error("authority {authority:?} is not trusted for update")]
+    UntrustedAuthority { authority: Authority },
+    #[error("event {event_id} was already shadowed by {by}")]
+    AlreadyShadowed { event_id: EventId, by: EventId },
+    #[error("event not found: {0}")]
+    NotFound(EventId),
+    #[error("storage: {0}")]
+    Storage(#[from] StorageError),
+}
+
 pub struct MemoryController<S: Storage> {
     storage: Arc<S>,
     install_key: Arc<InstallKey>,
@@ -49,6 +95,15 @@ pub struct MemoryController<S: Storage> {
     /// in Standard / Deep mode. When None, vector retrieval is skipped and
     /// every mode falls back to BM25.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Reconsolidation labile window. Each event returned by `search` enters
+    /// this window; while open, updates from a `Trusted` authority may
+    /// shadow the event with a corrected version.
+    labile_window: Duration,
+    /// (tenant_id, event_id) → labile_until. Pruned lazily on access.
+    labile: Mutex<HashMap<(TenantId, EventId), DateTime<Utc>>>,
+    /// (tenant_id, original_event_id) → shadow_event_id. A search result for
+    /// the original is replaced by the latest shadow during retrieval.
+    shadows: Mutex<HashMap<(TenantId, EventId), EventId>>,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -67,7 +122,19 @@ impl<S: Storage> MemoryController<S> {
             schema_version: CURRENT_SCHEMA_VERSION,
             chain_heads: Mutex::new(HashMap::new()),
             embedder: None,
+            labile_window: Duration::minutes(5),
+            labile: Mutex::new(HashMap::new()),
+            shadows: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_labile_window(mut self, duration: Duration) -> Self {
+        self.labile_window = duration;
+        self
+    }
+
+    pub fn labile_window(&self) -> Duration {
+        self.labile_window
     }
 
     pub fn with_signing_policy(mut self, policy: SigningPolicy) -> Self {
@@ -171,7 +238,34 @@ impl<S: Storage> MemoryController<S> {
     ///
     /// Late-interaction rerank (ColBERTv2 / MUVERA) and query expansion are
     /// the Standard→Deep delta in the v2 spec; both are follow-ups.
+    /// Hybrid retrieval.
+    ///
+    /// - `SearchMode::Cheap` → BM25 only.
+    /// - `SearchMode::Standard` / `Deep` → BM25 + vector, RRF-fused, when an
+    ///   embedder is configured. Otherwise falls back to BM25.
+    ///
+    /// Every returned event enters the reconsolidation labile window —
+    /// during `self.labile_window` from now, a trusted-authority `update`
+    /// can rewrite the trace. After the window closes the event is treated
+    /// as consolidated and only `invalidate_edge` / `delete` paths apply.
     pub async fn search(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
+        let raw = self.run_retrieval(query).await?;
+        let resolved = self.resolve_shadows(query.tenant_id, raw).await?;
+
+        // Open the labile window on every returned event.
+        let now = Utc::now();
+        let until = now + self.labile_window;
+        {
+            let mut labile = self.labile.lock().await;
+            for r in &resolved {
+                labile.insert((query.tenant_id, r.event_id), until);
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    async fn run_retrieval(&self, query: &SearchQuery) -> StorageResult<Vec<SearchResult>> {
         let do_vector = matches!(query.mode, SearchMode::Standard | SearchMode::Deep)
             && self.embedder.is_some();
         if !do_vector {
@@ -205,6 +299,139 @@ impl<S: Storage> MemoryController<S> {
         let vec_results = self.storage.search_vector(&vec_query).await?;
 
         Ok(rrf_fuse(bm_results, vec_results, query.k))
+    }
+
+    /// Walk the shadow chain to the most recent un-shadowed event for each
+    /// raw result. Results that have been shadowed are replaced by their
+    /// latest version (content + metadata pulled from storage).
+    async fn resolve_shadows(
+        &self,
+        tenant_id: TenantId,
+        mut results: Vec<SearchResult>,
+    ) -> StorageResult<Vec<SearchResult>> {
+        let shadows = self.shadows.lock().await.clone();
+        if shadows.is_empty() {
+            return Ok(results);
+        }
+        for r in results.iter_mut() {
+            let mut cur = r.event_id;
+            let mut hops = 0_usize;
+            // Bounded chain walk — prevents infinite loops if a shadow
+            // somehow points back to its source.
+            while let Some(next) = shadows.get(&(tenant_id, cur)) {
+                if *next == cur || hops > 8 {
+                    break;
+                }
+                cur = *next;
+                hops += 1;
+            }
+            if cur != r.event_id {
+                if let Some(latest) = self.storage.get_event(&cur).await? {
+                    r.event_id = latest.event_id;
+                    r.content = render_content(&latest.payload);
+                    r.metadata = serde_json::json!({
+                        "shadow_of": r.source_event_ids.first().map(|id| id.to_string()),
+                        "via_shadow": true,
+                    });
+                    r.source_event_ids = vec![latest.event_id];
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Update an event during its reconsolidation labile window.
+    ///
+    /// Writes a NEW event whose payload merges the original payload with
+    /// `patch` (top-level object merge, patch keys win). The new event's
+    /// id is recorded as a shadow of the original; subsequent searches
+    /// surface the shadow's content while preserving the original's audit
+    /// trail. Returns the new event's receipt.
+    pub async fn update(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        patch: Value,
+        authority: Authority,
+    ) -> Result<Receipt, UpdateError> {
+        if !authority.is_trusted() {
+            return Err(UpdateError::UntrustedAuthority { authority });
+        }
+
+        // Labile-window check.
+        let now = Utc::now();
+        {
+            let mut labile = self.labile.lock().await;
+            let key = (tenant_id, event_id);
+            match labile.get(&key) {
+                Some(until) if *until > now => {}
+                Some(_) => {
+                    labile.remove(&key);
+                    return Err(UpdateError::NotLabile { event_id });
+                }
+                None => return Err(UpdateError::NotLabile { event_id }),
+            }
+        }
+
+        // Already-shadowed check — refuse to write a second shadow over the
+        // same original, since the audit story gets confusing.
+        {
+            let shadows = self.shadows.lock().await;
+            if let Some(by) = shadows.get(&(tenant_id, event_id)) {
+                return Err(UpdateError::AlreadyShadowed {
+                    event_id,
+                    by: *by,
+                });
+            }
+        }
+
+        let original = self
+            .storage
+            .get_event(&event_id)
+            .await?
+            .ok_or(UpdateError::NotFound(event_id))?;
+
+        let mut new_payload = original.payload.clone();
+        merge_json_objects(&mut new_payload, patch);
+        // Provenance: stamp the shadow so a verifier can confirm intent.
+        if let Value::Object(map) = &mut new_payload {
+            map.insert(
+                "_shadowed_event_id".into(),
+                Value::String(event_id.to_string()),
+            );
+            map.insert(
+                "_shadowed_by_authority".into(),
+                Value::String(format!("{authority:?}").to_lowercase()),
+            );
+        }
+
+        let receipt = self
+            .write(
+                tenant_id,
+                original.scope_id,
+                original.source_id.clone(),
+                original.slot,
+                new_payload,
+                now,
+            )
+            .await?;
+
+        {
+            let mut shadows = self.shadows.lock().await;
+            shadows.insert((tenant_id, event_id), receipt.event_id);
+        }
+        Ok(receipt)
+    }
+
+    /// Is the event currently within its labile window? Useful for callers
+    /// who want to gate UI affordances ("this fact is editable").
+    pub async fn is_labile(&self, tenant_id: TenantId, event_id: EventId) -> bool {
+        let now = Utc::now();
+        let labile = self.labile.lock().await;
+        labile
+            .get(&(tenant_id, event_id))
+            .map(|until| *until > now)
+            .unwrap_or(false)
     }
 
     pub async fn reset(&self, tenant_id: TenantId) -> StorageResult<()> {
@@ -451,6 +678,20 @@ fn rrf_fuse(
             })
         })
         .collect()
+}
+
+/// Top-level object merge: patch keys win, non-object payloads are replaced.
+fn merge_json_objects(target: &mut Value, patch: Value) {
+    match (target, patch) {
+        (Value::Object(a), Value::Object(b)) => {
+            for (k, v) in b {
+                a.insert(k, v);
+            }
+        }
+        (slot, patch) => {
+            *slot = patch;
+        }
+    }
 }
 
 fn annotate_leg(meta: Value, leg: &str) -> Value {
@@ -1433,6 +1674,187 @@ mod tests {
         assert_eq!(out[0].event_id, EventId([1; 32]));
         // doc 1's fused score = 2/(60+1) ≈ 0.0328
         assert!((out[0].score - 2.0 / 61.0).abs() < 1e-6);
+    }
+
+    // --- Reconsolidation labile window ---
+
+    #[tokio::test]
+    async fn search_opens_labile_window_on_results() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "user lives in Berlin"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        // Before search, no labile window.
+        assert!(!ctrl.is_labile(tenant, r.event_id).await);
+        let q = SearchQuery::new("Berlin", tenant);
+        let hits = ctrl.search(&q).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(ctrl.is_labile(tenant, r.event_id).await);
+    }
+
+    #[tokio::test]
+    async fn trusted_update_within_window_shadows_original() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "user lives in Berlin"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        // Open the window via search.
+        let q = SearchQuery::new("Berlin", tenant);
+        ctrl.search(&q).await.unwrap();
+
+        let shadow = ctrl
+            .update(
+                tenant,
+                r.event_id,
+                json!({"content": "user lives in Munich"}),
+                Authority::User,
+            )
+            .await
+            .unwrap();
+        assert_ne!(shadow.event_id, r.event_id);
+        // Next search should surface the shadow's content, not the original.
+        let q2 = SearchQuery::new("Munich", tenant);
+        let hits = ctrl.search(&q2).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("Munich"));
+    }
+
+    #[tokio::test]
+    async fn untrusted_update_rejected_even_within_window() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "user lives in Berlin"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl.search(&SearchQuery::new("Berlin", tenant))
+            .await
+            .unwrap();
+
+        let err = ctrl
+            .update(
+                tenant,
+                r.event_id,
+                json!({"content": "user lives in 'hacked'"}),
+                Authority::AgentContinuation,
+            )
+            .await;
+        assert!(matches!(
+            err,
+            Err(UpdateError::UntrustedAuthority {
+                authority: Authority::AgentContinuation
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_without_open_window_rejected() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "stale"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        // No search has been issued, so no labile window is open.
+        let err = ctrl
+            .update(
+                tenant,
+                r.event_id,
+                json!({"content": "rewrite"}),
+                Authority::User,
+            )
+            .await;
+        assert!(matches!(err, Err(UpdateError::NotLabile { .. })));
+    }
+
+    #[tokio::test]
+    async fn double_update_within_window_rejected_as_already_shadowed() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "v1"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl.search(&SearchQuery::new("v1", tenant)).await.unwrap();
+
+        ctrl.update(tenant, r.event_id, json!({"content": "v2"}), Authority::User)
+            .await
+            .unwrap();
+        // Window is still open; the second update against the original should
+        // refuse because the audit trail of "which shadow is canonical"
+        // becomes ambiguous if we let two siblings coexist.
+        let err = ctrl
+            .update(tenant, r.event_id, json!({"content": "v3"}), Authority::User)
+            .await;
+        assert!(matches!(err, Err(UpdateError::AlreadyShadowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn labile_window_can_be_configured() {
+        let ctrl = ctrl().with_labile_window(Duration::seconds(0));
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "v1"}),
+                now(),
+            )
+            .await
+            .unwrap();
+        ctrl.search(&SearchQuery::new("v1", tenant)).await.unwrap();
+        // 0-duration window — by the time we call update, it has expired.
+        let err = ctrl
+            .update(tenant, r.event_id, json!({"content": "v2"}), Authority::User)
+            .await;
+        assert!(matches!(err, Err(UpdateError::NotLabile { .. })));
     }
 
     #[test]

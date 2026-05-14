@@ -17,7 +17,7 @@ pub mod search;
 pub mod storage;
 pub mod working;
 
-pub use controller::MemoryController;
+pub use controller::{Authority, MemoryController, UpdateError};
 pub use embedder::{cosine, DeterministicEmbedder, Embedder, EmbedderError, EMBEDDING_DIM};
 pub use in_memory::InMemoryStorage;
 pub use search::{SearchMode, SearchQuery, SearchResult, VectorSearchQuery};
