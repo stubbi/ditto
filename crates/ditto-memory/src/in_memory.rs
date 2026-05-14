@@ -651,6 +651,29 @@ impl Storage for InMemoryStorage {
         Ok(inner.blobs.remove(&(tenant_id, hash)).is_some())
     }
 
+    async fn list_episodic(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<Event>> {
+        let inner = self.inner.lock().unwrap();
+        let events = match inner.events.get(&tenant_id) {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        let mut out: Vec<Event> = events
+            .iter()
+            .filter(|e| scope_id.is_none_or(|s| e.scope_id == s))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.event_id.0.cmp(&b.event_id.0)));
+        if let Some(lim) = limit {
+            out.truncate(lim);
+        }
+        Ok(out)
+    }
+
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {
         let inner = self.inner.lock().unwrap();
         let events = match inner.events.get(&query.tenant_id) {

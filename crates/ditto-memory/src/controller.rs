@@ -28,7 +28,10 @@ use ditto_core::{
 };
 
 use crate::embedder::Embedder;
-use crate::search::{SearchMode, SearchQuery, SearchResult, VectorSearchQuery};
+use crate::search::{
+    RejectedCandidate, SearchExplained, SearchMode, SearchQuery, SearchResult,
+    VectorSearchQuery, WhyRetrieved,
+};
 use crate::storage::{CascadeReport, Storage, StorageError, StorageResult};
 
 #[derive(Clone, Copy)]
@@ -90,6 +93,14 @@ pub struct DeletionProof {
 pub enum DeletionTarget {
     Node(NodeId),
     Blob(BlobHash),
+}
+
+/// Per-line outcome of an `import_episodic_jsonl` run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub written: u32,
+    pub skipped: u32,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -443,6 +454,176 @@ impl<S: Storage> MemoryController<S> {
             shadows.insert((tenant_id, event_id), receipt.event_id);
         }
         Ok(receipt)
+    }
+
+    /// Same as `search` but returns retrieval provenance: which leg(s) saw
+    /// each event, per-leg ranks, rejected candidates. The architecture's
+    /// "first-class, not debug-only" explain surface.
+    pub async fn search_explain(&self, query: &SearchQuery) -> StorageResult<SearchExplained> {
+        let do_vector = matches!(query.mode, SearchMode::Standard | SearchMode::Deep)
+            && self.embedder.is_some();
+
+        let leg_k = query.k.saturating_mul(3).max(query.k);
+        let mut bm_query = query.clone();
+        bm_query.k = leg_k;
+        let bm_results = self.storage.search(&bm_query).await?;
+
+        let mut vec_results: Vec<SearchResult> = Vec::new();
+        if do_vector {
+            let emb = self.embedder.as_ref().unwrap();
+            let mut embs = emb
+                .embed(std::slice::from_ref(&query.query))
+                .await
+                .map_err(|e| StorageError::Other(format!("query embed: {e}")))?;
+            if let Some(q_emb) = embs.pop() {
+                let vec_query = VectorSearchQuery {
+                    embedding: q_emb,
+                    tenant_id: query.tenant_id,
+                    scope_id: query.scope_id,
+                    sources: query.sources.clone(),
+                    k: leg_k,
+                };
+                vec_results = self.storage.search_vector(&vec_query).await?;
+            }
+        }
+
+        let bm_ranks: Vec<EventId> = bm_results.iter().map(|r| r.event_id).collect();
+        let vec_ranks: Vec<EventId> = vec_results.iter().map(|r| r.event_id).collect();
+        let bm_scores: HashMap<EventId, (usize, f32)> = bm_results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.event_id, (i, r.score)))
+            .collect();
+        let vec_scores: HashMap<EventId, (usize, f32)> = vec_results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.event_id, (i, r.score)))
+            .collect();
+
+        let fused = if do_vector {
+            rrf_fuse(bm_results, vec_results, leg_k)
+        } else {
+            bm_results
+        };
+
+        let mut top = fused.clone();
+        top.truncate(query.k);
+        let resolved = self.resolve_shadows(query.tenant_id, top).await?;
+        let now = Utc::now();
+        let until = now + self.labile_window;
+        {
+            let mut labile = self.labile.lock().await;
+            for r in &resolved {
+                labile.insert((query.tenant_id, r.event_id), until);
+            }
+        }
+
+        let why: Vec<WhyRetrieved> = resolved
+            .iter()
+            .map(|r| {
+                let (br, bs) = bm_scores
+                    .get(&r.event_id)
+                    .map(|(i, s)| (Some(*i + 1), Some(*s)))
+                    .unwrap_or((None, None));
+                let (vr, vs) = vec_scores
+                    .get(&r.event_id)
+                    .map(|(i, s)| (Some(*i + 1), Some(*s)))
+                    .unwrap_or((None, None));
+                WhyRetrieved {
+                    event_id: r.event_id,
+                    fused_score: r.score,
+                    bm25_rank: br,
+                    vector_rank: vr,
+                    bm25_score: bs,
+                    vector_score: vs,
+                }
+            })
+            .collect();
+
+        let kept_ids: std::collections::HashSet<EventId> =
+            resolved.iter().map(|r| r.event_id).collect();
+        let mut rejected: Vec<RejectedCandidate> = fused
+            .iter()
+            .skip(query.k)
+            .filter(|r| !kept_ids.contains(&r.event_id))
+            .map(|r| RejectedCandidate {
+                event_id: r.event_id,
+                fused_score: r.score,
+                bm25_rank: bm_scores.get(&r.event_id).map(|(i, _)| *i + 1),
+                vector_rank: vec_scores.get(&r.event_id).map(|(i, _)| *i + 1),
+            })
+            .collect();
+        rejected.truncate(32);
+
+        Ok(SearchExplained {
+            results: resolved,
+            mode_used: query.mode,
+            embedder_used: do_vector,
+            bm25_ranks: bm_ranks,
+            vector_ranks: vec_ranks,
+            why_retrieved: why,
+            rejected_candidates: rejected,
+        })
+    }
+
+    /// Stream a tenant's episodic events as JSONL into `writer`. One event
+    /// per line; the wire shape is the `Event` serde representation, so
+    /// `import_episodic_jsonl` round-trips losslessly.
+    pub async fn export_episodic_jsonl<W: std::io::Write>(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        mut writer: W,
+    ) -> StorageResult<usize> {
+        let events = self.storage.list_episodic(tenant_id, scope_id, None).await?;
+        let mut n = 0_usize;
+        for e in events {
+            let line = serde_json::to_string(&e)
+                .map_err(|err| StorageError::Other(format!("export serialize: {err}")))?;
+            writeln!(writer, "{line}")
+                .map_err(|err| StorageError::Other(format!("export write: {err}")))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Read JSONL produced by `export_episodic_jsonl` and replay writes.
+    /// Idempotent on event_id (content addressing) — duplicates are
+    /// counted as `skipped`, not errors.
+    pub async fn import_episodic_jsonl<R: std::io::BufRead>(
+        &self,
+        reader: R,
+    ) -> StorageResult<ImportReport> {
+        let mut report = ImportReport::default();
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = line
+                .map_err(|e| StorageError::Other(format!("import read line {line_no}: {e}")))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: Event = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(e) => {
+                    report.errors.push(format!("line {line_no}: {e}"));
+                    continue;
+                }
+            };
+            if self.storage.get_receipt(&event.event_id).await?.is_some() {
+                report.skipped += 1;
+                continue;
+            }
+            self.write(
+                event.tenant_id,
+                event.scope_id,
+                event.source_id.clone(),
+                event.slot,
+                event.payload.clone(),
+                event.timestamp,
+            )
+            .await?;
+            report.written += 1;
+        }
+        Ok(report)
     }
 
     // --- Verifiable cascade delete ---
@@ -1952,6 +2133,155 @@ mod tests {
             .update(tenant, r.event_id, json!({"content": "v3"}), Authority::User)
             .await;
         assert!(matches!(err, Err(UpdateError::AlreadyShadowed { .. })));
+    }
+
+    // --- Explain / export / import ---
+
+    #[tokio::test]
+    async fn search_explain_reports_per_leg_ranks_when_embedder_set() {
+        let ctrl = ctrl_with_embedder();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha beta"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "gamma"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let q = SearchQuery::new("alpha", tenant);
+        let exp = ctrl.search_explain(&q).await.unwrap();
+        assert!(exp.embedder_used);
+        assert_eq!(exp.results.len(), 2);
+        assert_eq!(exp.mode_used, SearchMode::Standard);
+        // The "alpha beta" event must appear in BOTH legs.
+        let alpha_id = exp.results[0].event_id;
+        let why = exp
+            .why_retrieved
+            .iter()
+            .find(|w| w.event_id == alpha_id)
+            .unwrap();
+        assert!(why.bm25_rank.is_some());
+        assert!(why.vector_rank.is_some());
+    }
+
+    #[tokio::test]
+    async fn search_explain_works_without_embedder() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let exp = ctrl
+            .search_explain(&SearchQuery::new("alpha", tenant))
+            .await
+            .unwrap();
+        assert!(!exp.embedder_used);
+        assert!(exp.vector_ranks.is_empty());
+        assert!(!exp.bm25_ranks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_jsonl_round_trips_through_import() {
+        let src = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        for content in ["one", "two", "three"] {
+            src.write(
+                tenant,
+                scope,
+                "test",
+                Slot::EpisodicIndex,
+                json!({"content": content}),
+                now(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let exported = src
+            .export_episodic_jsonl(tenant, None, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(exported, 3);
+
+        // Round-trip into a fresh controller backed by an empty store.
+        let dst = ctrl();
+        let report = dst
+            .import_episodic_jsonl(std::io::BufReader::new(buf.as_slice()))
+            .await
+            .unwrap();
+        assert_eq!(report.written, 3);
+        assert_eq!(report.skipped, 0);
+        assert!(report.errors.is_empty());
+
+        let hits = dst
+            .search(&SearchQuery::new("two", tenant))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_is_idempotent_on_event_id() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "x"}),
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        ctrl.export_episodic_jsonl(tenant, None, &mut buf)
+            .await
+            .unwrap();
+        // Re-import into the same controller — every event already exists.
+        let report = ctrl
+            .import_episodic_jsonl(std::io::BufReader::new(buf.as_slice()))
+            .await
+            .unwrap();
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn import_reports_malformed_lines_without_aborting() {
+        let ctrl = ctrl();
+        let bad = b"not json\n{\"event_id\":\"deadbeef\"}\n";
+        let report = ctrl
+            .import_episodic_jsonl(std::io::BufReader::new(&bad[..]))
+            .await
+            .unwrap();
+        // Both lines should fail parse; controller doesn't abort.
+        assert_eq!(report.written, 0);
+        assert_eq!(report.errors.len(), 2);
     }
 
     // --- Verifiable cascade delete ---

@@ -17,9 +17,14 @@ pub mod search;
 pub mod storage;
 pub mod working;
 
-pub use controller::{Authority, DeletionProof, DeletionTarget, MemoryController, UpdateError};
+pub use controller::{
+    Authority, DeletionProof, DeletionTarget, ImportReport, MemoryController, UpdateError,
+};
 pub use embedder::{cosine, DeterministicEmbedder, Embedder, EmbedderError, EMBEDDING_DIM};
 pub use in_memory::InMemoryStorage;
-pub use search::{SearchMode, SearchQuery, SearchResult, VectorSearchQuery};
+pub use search::{
+    RejectedCandidate, SearchExplained, SearchMode, SearchQuery, SearchResult, VectorSearchQuery,
+    WhyRetrieved,
+};
 pub use storage::Storage;
 pub use working::{Observation, ObservationKind, WorkingMemory};

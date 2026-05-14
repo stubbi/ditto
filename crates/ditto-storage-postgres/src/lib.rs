@@ -986,6 +986,30 @@ impl Storage for PostgresStorage {
         Ok(n.rows_affected() > 0)
     }
 
+    async fn list_episodic(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<Event>> {
+        let rows = sqlx::query(
+            r#"SELECT event_id, prev_event_id, tenant_id, scope_id, source_id, slot,
+                      payload, ts, schema_version
+               FROM episodic
+               WHERE tenant_id = $1
+                 AND ($2::uuid IS NULL OR scope_id = $2)
+               ORDER BY ts, event_id
+               LIMIT COALESCE($3::bigint, 1000000000)"#,
+        )
+        .bind(tenant_id.0)
+        .bind(scope_id.map(|s| s.0))
+        .bind(limit.map(|l| l as i64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("list_episodic: {e}")))?;
+        rows.into_iter().map(row_to_event).collect()
+    }
+
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {
         let vector_lit = embedding_to_pg_literal(&query.embedding);
         let sources = query.sources.as_deref().map(|s| s.to_vec());

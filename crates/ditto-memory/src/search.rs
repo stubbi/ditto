@@ -65,3 +65,45 @@ pub struct VectorSearchQuery {
     pub sources: Option<Vec<String>>,
     pub k: usize,
 }
+
+/// Rich search result with retrieval provenance — `why_retrieved`,
+/// per-leg ranks, rejected candidates. Returned by `MemoryController::
+/// search_explain`. Architecture spec: this is a first-class API, not
+/// debug-only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchExplained {
+    pub results: Vec<SearchResult>,
+    pub mode_used: SearchMode,
+    pub embedder_used: bool,
+    /// Event ids in BM25-leg order (full leg, before fusion). Empty when
+    /// the mode skipped BM25 (no current mode does, but reserved).
+    pub bm25_ranks: Vec<EventId>,
+    /// Event ids in vector-leg order. Empty when mode is Cheap or no
+    /// embedder was configured.
+    pub vector_ranks: Vec<EventId>,
+    /// Per-result attribution: which leg(s) saw it, fused score, rank in
+    /// each leg (1-indexed; `None` if absent from that leg).
+    pub why_retrieved: Vec<WhyRetrieved>,
+    /// Candidates that appeared in some leg but did not make the top-K.
+    /// Sorted by fused score descending; capped to top-32 to keep the
+    /// payload bounded.
+    pub rejected_candidates: Vec<RejectedCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WhyRetrieved {
+    pub event_id: EventId,
+    pub fused_score: f32,
+    pub bm25_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+    pub bm25_score: Option<f32>,
+    pub vector_score: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RejectedCandidate {
+    pub event_id: EventId,
+    pub fused_score: f32,
+    pub bm25_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+}

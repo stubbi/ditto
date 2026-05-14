@@ -274,6 +274,16 @@ pub trait Storage: Send + Sync {
     /// Delete a blob from the tenant's CAS. Returns true when the blob
     /// existed and was removed, false when it was already absent.
     async fn delete_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool>;
+
+    /// Enumerate episodic events for a tenant, oldest first. Used by export
+    /// and by replay paths. `limit = None` returns all events; backends
+    /// should still chunk internally to bound memory.
+    async fn list_episodic(
+        &self,
+        tenant_id: TenantId,
+        scope_id: Option<ScopeId>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<Event>>;
 }
 
 /// Side effects of a cascade delete — folded into the DeletionProof payload
