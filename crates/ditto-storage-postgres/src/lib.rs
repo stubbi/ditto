@@ -1102,6 +1102,89 @@ impl Storage for PostgresStorage {
         }
     }
 
+    async fn get_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+    ) -> StorageResult<Option<f32>> {
+        let row = sqlx::query(
+            "SELECT salience FROM episodic WHERE tenant_id = $1 AND event_id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(&event_id.0[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("get_salience: {e}")))?;
+        Ok(row.and_then(|r| r.try_get("salience").ok()))
+    }
+
+    async fn set_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        value: f32,
+    ) -> StorageResult<f32> {
+        let clamped = value.clamp(0.0, 1.0);
+        let n = sqlx::query(
+            r#"UPDATE episodic SET salience = $3
+               WHERE tenant_id = $1 AND event_id = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&event_id.0[..])
+        .bind(clamped)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("set_salience: {e}")))?;
+        if n.rows_affected() == 0 {
+            return Err(StorageError::Other(format!("event not found: {event_id}")));
+        }
+        Ok(clamped)
+    }
+
+    async fn bump_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        delta: f32,
+    ) -> StorageResult<f32> {
+        let row = sqlx::query(
+            r#"UPDATE episodic
+               SET salience = GREATEST(0.0, LEAST(1.0, salience + $3))
+               WHERE tenant_id = $1 AND event_id = $2
+               RETURNING salience"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&event_id.0[..])
+        .bind(delta)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("bump_salience: {e}")))?;
+        match row {
+            Some(r) => r
+                .try_get("salience")
+                .map_err(|e| StorageError::Other(format!("salience col: {e}"))),
+            None => Err(StorageError::Other(format!("event not found: {event_id}"))),
+        }
+    }
+
+    async fn decay_salience(
+        &self,
+        tenant_id: TenantId,
+        factor: f32,
+    ) -> StorageResult<u32> {
+        let factor = factor.clamp(0.0, 1.0);
+        let n = sqlx::query(
+            r#"UPDATE episodic SET salience = salience * $2
+               WHERE tenant_id = $1 AND salience > 0.0"#,
+        )
+        .bind(tenant_id.0)
+        .bind(factor)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("decay_salience: {e}")))?;
+        Ok(u32::try_from(n.rows_affected()).unwrap_or(u32::MAX))
+    }
+
     async fn list_episodic(
         &self,
         tenant_id: TenantId,

@@ -332,6 +332,41 @@ pub trait Storage: Send + Sync {
         tenant_id: TenantId,
         original: EventId,
     ) -> StorageResult<Option<EventId>>;
+
+    // --- Salience ---
+
+    /// Fetch the salience score of an event. Returns `None` when the event
+    /// does not exist. Range: [0.0, 1.0]; 0.5 is the default.
+    async fn get_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+    ) -> StorageResult<Option<f32>>;
+
+    /// Set salience directly. Clamped to [0.0, 1.0]. Returns the new value.
+    async fn set_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        value: f32,
+    ) -> StorageResult<f32>;
+
+    /// Additive update — used by the ripple consolidator to bump events
+    /// tagged-for-dream. Clamped after addition.
+    async fn bump_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        delta: f32,
+    ) -> StorageResult<f32>;
+
+    /// Multiplicative decay — used by the long-sleep scheduler.
+    /// Returns the count of events whose salience was decreased.
+    async fn decay_salience(
+        &self,
+        tenant_id: TenantId,
+        factor: f32,
+    ) -> StorageResult<u32>;
 }
 
 /// Side effects of a cascade delete — folded into the DeletionProof payload

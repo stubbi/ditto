@@ -56,6 +56,9 @@ struct Inner {
     labile: HashMap<(TenantId, EventId), DateTime<Utc>>,
     /// (tenant_id, original) -> shadow event_id.
     shadows: HashMap<(TenantId, EventId), EventId>,
+    /// (tenant_id, event_id) -> salience. Defaults to 0.5 when absent;
+    /// the salience-aware methods materialize the row on first set/bump.
+    salience: HashMap<(TenantId, EventId), f32>,
 }
 
 impl InMemoryStorage {
@@ -156,6 +159,7 @@ impl Storage for InMemoryStorage {
         inner.embeddings.retain(|(t, _), _| *t != tenant_id);
         inner.labile.retain(|(t, _), _| *t != tenant_id);
         inner.shadows.retain(|(t, _), _| *t != tenant_id);
+        inner.salience.retain(|(t, _), _| *t != tenant_id);
         Ok(())
     }
 
@@ -744,6 +748,79 @@ impl Storage for InMemoryStorage {
     ) -> StorageResult<Option<EventId>> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.shadows.get(&(tenant_id, original)).copied())
+    }
+
+    async fn get_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+    ) -> StorageResult<Option<f32>> {
+        let inner = self.inner.lock().unwrap();
+        // Does the event exist for this tenant?
+        let exists = inner
+            .events
+            .get(&tenant_id)
+            .map(|v| v.iter().any(|e| e.event_id == event_id))
+            .unwrap_or(false);
+        if !exists {
+            return Ok(None);
+        }
+        Ok(Some(
+            inner
+                .salience
+                .get(&(tenant_id, event_id))
+                .copied()
+                .unwrap_or(0.5),
+        ))
+    }
+
+    async fn set_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        value: f32,
+    ) -> StorageResult<f32> {
+        let clamped = value.clamp(0.0, 1.0);
+        let mut inner = self.inner.lock().unwrap();
+        inner.salience.insert((tenant_id, event_id), clamped);
+        Ok(clamped)
+    }
+
+    async fn bump_salience(
+        &self,
+        tenant_id: TenantId,
+        event_id: EventId,
+        delta: f32,
+    ) -> StorageResult<f32> {
+        let mut inner = self.inner.lock().unwrap();
+        let cur = inner
+            .salience
+            .get(&(tenant_id, event_id))
+            .copied()
+            .unwrap_or(0.5);
+        let next = (cur + delta).clamp(0.0, 1.0);
+        inner.salience.insert((tenant_id, event_id), next);
+        Ok(next)
+    }
+
+    async fn decay_salience(
+        &self,
+        tenant_id: TenantId,
+        factor: f32,
+    ) -> StorageResult<u32> {
+        let factor = factor.clamp(0.0, 1.0);
+        let mut inner = self.inner.lock().unwrap();
+        let mut affected = 0_u32;
+        for ((t, _), s) in inner.salience.iter_mut() {
+            if *t == tenant_id {
+                let new = (*s * factor).clamp(0.0, 1.0);
+                if new < *s {
+                    affected += 1;
+                    *s = new;
+                }
+            }
+        }
+        Ok(affected)
     }
 
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {
