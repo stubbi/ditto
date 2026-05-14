@@ -1,0 +1,44 @@
+{
+  "backend": "ditto",
+  "benchmark": "ditto-provenance-bench",
+  "examples": [
+    {
+      "details": {
+        "hits": 0,
+        "leak": false,
+        "recall": 0.0,
+        "required": 1
+      },
+      "example_id": "prov-001-birthday",
+      "passed": false,
+      "score": 0.0
+    },
+    {
+      "details": {
+        "hits": 0,
+        "leak": false,
+        "recall": 0.0,
+        "required": 1
+      },
+      "example_id": "prov-002-updated-fact",
+      "passed": false,
+      "score": 0.0
+    },
+    {
+      "details": {
+        "hits": 0,
+        "leak": false,
+        "recall": 0.0,
+        "required": 1
+      },
+      "example_id": "prov-003-multi-hop",
+      "passed": false,
+      "score": 0.0
+    }
+  ],
+  "fixture_version": "1",
+  "metadata": {},
+  "passed": 0,
+  "score": 0.0,
+  "total": 3
+}

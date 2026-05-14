@@ -7,14 +7,31 @@ from pathlib import Path
 
 import click
 
-from ditto_eval.backends import StubBackend
+from collections.abc import Callable
+
+from ditto_eval.backends import DittoBackend, StubBackend
 from ditto_eval.backends.base import MemoryBackend
 from ditto_eval.benchmarks import ProvenanceBench
 from ditto_eval.benchmarks.base import Benchmark
 from ditto_eval.runner import run_benchmark
 
-BACKENDS: dict[str, type[MemoryBackend]] = {
+
+def _mem0_factory() -> MemoryBackend:
+    from ditto_eval.backends.mem0_backend import Mem0Backend
+
+    return Mem0Backend()
+
+
+BackendFactory = Callable[[], MemoryBackend]
+
+# Each entry is a zero-arg factory; lazy imports keep optional deps optional.
+BACKENDS: dict[str, BackendFactory] = {
     "stub": StubBackend,
+    "ditto": DittoBackend,
+    # Gated: Mem0Backend requires OPENAI_API_KEY. The factory raises with a
+    # clear message if credentials are missing, so CI runs without keys
+    # skip this row rather than fabricate numbers.
+    "mem0": _mem0_factory,
 }
 
 BENCHMARKS: dict[str, type[Benchmark]] = {
@@ -44,7 +61,7 @@ def run(benchmark: str, backend: str, fixture: Path | None, results_dir: Path) -
 
     async def _go() -> None:
         b = bench_cls(fixture_path)
-        bk = backend_cls()
+        bk = backend_cls()  # factory call
         try:
             result = await run_benchmark(b, bk, results_dir=results_dir)
         finally:

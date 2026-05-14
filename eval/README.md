@@ -9,9 +9,22 @@ We're starting eval-first on purpose: before Ditto writes a line of memory-engin
 v0.0.1. Implemented:
 
 - `MemoryBackend` protocol (the contract every adapter implements)
-- `StubBackend` — reference in-memory substring scanner; not a real memory system
+- `StubBackend` — reference in-memory substring scanner; control floor
+- `DittoBackend` — speaks MCP stdio to a `ditto serve` subprocess
+- `Mem0Backend` — gated on `OPENAI_API_KEY` (one bounded competitor adapter)
 - `ProvenanceBench` — Ditto-Provenance-Bench runner, with a 3-example v0 fixture
-- CLI: `ditto-eval run --benchmark provenance --backend stub`
+- CLI: `ditto-eval run --benchmark provenance --backend {stub,ditto,mem0}`
+
+## First-eval results
+
+```
+ditto-provenance-bench on stub:    0/3  score 0.000   (substring control floor)
+ditto-provenance-bench on ditto:   0/3  score 0.000   (BM25/tsvector only; semantic retrieval pending)
+```
+
+Diagnostic: the integration path (Python harness → MCP → `ditto serve` → in-memory backend) works end-to-end. Ditto and the stub score identically because v0 retrieval is lexical, and the v0 fixtures are deliberately semantic-recall hard ("When was the user born?" vs an event saying "birthday is March 14"). Closing the gap requires vector retrieval + late-interaction rerank — the next memory work.
+
+Checked-in results under `results/` so the trajectory per backend per date is auditable. We deliberately do **not** publish Mem0/Zep/Mastra comparisons on `LongMemEval` / `BEAM` yet — Ditto's retrieval stack is incomplete, and the post-MemPalace-#214 methodology bar requires matched-conditions BM25 baselines at full corpus scale before any public comparison.
 
 Forthcoming (in roughly this order):
 

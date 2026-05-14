@@ -20,6 +20,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 
 use ditto_core::{InstallKey, ScopeId, Slot, TenantId};
+use ditto_mcp::serve_stdio;
 use ditto_memory::{InMemoryStorage, MemoryController, SearchMode, SearchQuery, Storage};
 use ditto_render::{LocalFilesystem, RenderJob};
 use ditto_storage_postgres::PostgresStorage;
@@ -83,11 +84,19 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Run an MCP server on stdio. Speaks the Model Context Protocol so
+    /// Claude Code / Cursor / Zed / Codex Desktop can use Ditto's memory.
+    Serve,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go to stderr — stdout is reserved for JSON-RPC framing when
+    // running as an MCP server, and even non-serve commands print
+    // structured output to stdout that callers parse.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -187,6 +196,13 @@ async fn run_cmd<S: Storage + 'static>(
                 report.pages_removed,
                 out.display()
             );
+            Ok(())
+        }
+        Cmd::Serve => {
+            // Hand control to the MCP server. Logs go to stderr (configured
+            // earlier); stdio is reserved for the JSON-RPC framing.
+            let _ = storage; // referenced via ctrl
+            serve_stdio(Arc::new(ctrl)).await?;
             Ok(())
         }
     }
