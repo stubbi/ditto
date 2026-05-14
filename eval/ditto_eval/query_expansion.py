@@ -26,18 +26,31 @@ import json
 from ditto_eval.llm import ChatMessage, LlmClient
 
 EXPANSION_SYSTEM = (
-    "You rewrite a user question into 2-3 alternate phrasings that "
-    "emphasize different aspects: the entity, the action verb, the "
-    "object/topic. Do not change the meaning. Use diverse vocabulary "
-    "so the rewrites are useful for keyword/semantic retrieval. "
-    "Return JSON: {\"variants\": [<phrasings>]}. Do not include the "
-    "original question in your output."
+    "You rewrite a user question for memory retrieval. Return BOTH:\n"
+    "  • 2 alternate phrasings of the question (different vocabulary,\n"
+    "    same meaning)\n"
+    "  • 2 hypothetical answer phrases — sentences that might appear in\n"
+    "    the source memory and would answer the question if found. Use\n"
+    "    vocabulary the answer turn might actually contain. This is the\n"
+    "    HyDE technique (Gao et al. 2022).\n"
+    "Example: question = 'What did Caroline research?' →\n"
+    "  variants: ['What topics was Caroline studying?',\n"
+    "             'What did Caroline look into?'],\n"
+    "  hypothetical_answers: ['Caroline was researching adoption.',\n"
+    "                         'Caroline is studying counseling.']\n"
+    "Return JSON: {\"variants\": [...], \"hypothetical_answers\": [...]}."
 )
 
 
 async def expand_query(llm: LlmClient, question: str, model: str | None = None) -> list[str]:
-    """Return [original, *alt_phrasings]. Always includes original first."""
-    prompt = f"Question: {question}\n\nReturn JSON with 2-3 alternate phrasings."
+    """Return [original, *alt_phrasings, *hypothetical_answer_phrases].
+
+    Always includes the original question first so we never lose its
+    signal. HyDE phrasings are searched alongside paraphrases — they
+    match evidence turns that share answer vocabulary even when no
+    question vocab overlaps.
+    """
+    prompt = f"Question: {question}\n\nReturn JSON."
     try:
         data = await llm.chat_json(
             [
@@ -45,13 +58,13 @@ async def expand_query(llm: LlmClient, question: str, model: str | None = None) 
                 ChatMessage(role="user", content=prompt),
             ],
             model=model,
-            max_tokens=200,
+            max_tokens=300,
         )
         variants = data.get("variants") or []
-        # Defensive: keep only strings, dedupe, cap at 3.
+        hyde = data.get("hypothetical_answers") or []
         seen = {question.lower()}
         out = [question]
-        for v in variants:
+        for v in list(variants) + list(hyde):
             if not isinstance(v, str):
                 continue
             v = v.strip()
@@ -59,7 +72,7 @@ async def expand_query(llm: LlmClient, question: str, model: str | None = None) 
                 continue
             seen.add(v.lower())
             out.append(v)
-            if len(out) >= 4:
+            if len(out) >= 5:  # original + 2 variants + 2 hyde
                 break
         return out
     except Exception:  # noqa: BLE001 — bench-level catch
