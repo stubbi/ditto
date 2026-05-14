@@ -18,6 +18,7 @@ Forthcoming:
 
 from ditto_eval.benchmarks.base import Benchmark, BenchmarkResult, ExampleResult
 from ditto_eval.benchmarks.locomo import LocomoBench, LocomoConfig
+from ditto_eval.benchmarks.locomo_retrieval import LocomoRetrievalBench
 from ditto_eval.benchmarks.provenance import ProvenanceBench
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "ExampleResult",
     "LocomoBench",
     "LocomoConfig",
+    "LocomoRetrievalBench",
     "ProvenanceBench",
 ]

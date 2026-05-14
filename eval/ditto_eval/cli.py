@@ -11,7 +11,12 @@ from collections.abc import Callable
 
 from ditto_eval.backends import DittoBackend, StubBackend
 from ditto_eval.backends.base import MemoryBackend
-from ditto_eval.benchmarks import LocomoBench, LocomoConfig, ProvenanceBench
+from ditto_eval.benchmarks import (
+    LocomoBench,
+    LocomoConfig,
+    LocomoRetrievalBench,
+    ProvenanceBench,
+)
 from ditto_eval.benchmarks.base import Benchmark
 from ditto_eval.runner import run_benchmark
 
@@ -37,6 +42,7 @@ BACKENDS: dict[str, BackendFactory] = {
 BENCHMARKS: dict[str, type[Benchmark]] = {
     "provenance": ProvenanceBench,
     "locomo": LocomoBench,
+    "locomo-retrieval": LocomoRetrievalBench,
 }
 
 DEFAULT_FIXTURES = {
@@ -44,6 +50,7 @@ DEFAULT_FIXTURES = {
     # LoCoMo uses a *directory* as its fixture — the dataset JSON is
     # downloaded into it on first use, then reused from cache.
     "locomo": Path(__file__).parent.parent / "fixtures" / "locomo",
+    "locomo-retrieval": Path(__file__).parent.parent / "fixtures" / "locomo",
 }
 
 
@@ -135,7 +142,7 @@ def run(
     backend_cls = BACKENDS[backend]
 
     async def _go() -> None:
-        if benchmark == "locomo":
+        if benchmark in ("locomo", "locomo-retrieval"):
             convs = (
                 [int(x) for x in locomo_conversations.split(",")]
                 if locomo_conversations
