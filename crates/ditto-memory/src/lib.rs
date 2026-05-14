@@ -1,0 +1,21 @@
+//! The MemoryController + Storage trait.
+//!
+//! `Storage` is the seam between the controller and the actual database. The
+//! v0 implementation exposes the in-process `InMemoryStorage` (for tests and a
+//! placeholder for the future SQLite embedded mode); `ditto-storage-postgres`
+//! provides the production Postgres backend.
+//!
+//! The controller's job is to enforce the single-writer invariant: every
+//! `write` goes through `commit`, which (a) checks idempotency against the
+//! content-addressed event_id, (b) emits a signed receipt, (c) hands off to
+//! storage in a single transaction.
+
+pub mod controller;
+pub mod in_memory;
+pub mod search;
+pub mod storage;
+
+pub use controller::MemoryController;
+pub use in_memory::InMemoryStorage;
+pub use search::{SearchMode, SearchQuery, SearchResult};
+pub use storage::Storage;

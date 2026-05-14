@@ -2,7 +2,31 @@
 
 An agent harness with memory coherence, OS-enforced sandboxing, multi-tenant by design, and eval-as-CI.
 
-**Status:** pre-alpha. This repo currently holds architecture sketches, not code. The codebase begins after the architecture stabilizes.
+**Status:** v0.0.1. Memory architecture is committed (see [`docs/architecture/memory.md`](docs/architecture/memory.md) v2). First Rust crates are scaffolded:
+
+```
+crates/
+  ditto-core/             types, canonical JSON, content addressing, Ed25519 signing
+  ditto-memory/           MemoryController + Storage trait + InMemoryStorage reference
+  ditto-storage-postgres/ Postgres backend (sqlx + tsvector BM25; pgvector + KG to come)
+  ditto-cli/              `ditto migrate / write / search / keygen`
+migrations/
+  initial_schema.sql      episodic + receipt tables
+eval/
+  ditto-eval Python package — see eval/README.md
+```
+
+25 tests green (canonical JSON determinism, content addressing, Ed25519 sign/verify, hash chain, signed receipts, idempotent writes, in-memory search). Cross-language interop check: `EventId` computed in Rust matches `content_address` in the Python eval harness for the same payload bit-for-bit.
+
+```bash
+cargo build && cargo test                 # 25/25 pass
+cargo run --bin ditto -- keygen           # print 32-byte Ed25519 install secret (hex)
+cargo run --bin ditto -- write \
+  --tenant <uuid> --scope <uuid> \
+  --source test --payload '{"content":"hello"}'
+```
+
+In-memory backend is the default when no `--database-url` is set; Postgres backend works once `ditto migrate` has run against a database.
 
 ## Why Ditto exists
 

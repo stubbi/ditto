@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ditto-core",
+    "crates/ditto-memory",
+    "crates/ditto-storage-postgres",
+    "crates/ditto-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "Unspecified"
+repository = "https://github.com/stubbi/ditto"
+
+[workspace.dependencies]
+ditto-core = { path = "crates/ditto-core", version = "0.0.1" }
+ditto-memory = { path = "crates/ditto-memory", version = "0.0.1" }
+ditto-storage-postgres = { path = "crates/ditto-storage-postgres", version = "0.0.1" }
+
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
