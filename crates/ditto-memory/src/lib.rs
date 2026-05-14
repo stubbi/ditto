@@ -16,6 +16,7 @@ pub mod extractor;
 pub mod in_memory;
 pub mod long_sleep;
 pub mod policy;
+pub mod reranker;
 pub mod search;
 pub mod storage;
 pub mod working;
@@ -29,6 +30,7 @@ pub use extractor::{name_to_node_id, Extraction, Extractor, NoopExtractor, Propo
 pub use in_memory::InMemoryStorage;
 pub use long_sleep::{LongSleepConfig, LongSleepScheduler, LongSleepTick};
 pub use policy::{HeuristicPolicy, Operation, Policy, PolicyContext, RefusePolicy};
+pub use reranker::{NoopReranker, Reranker, ReverseReranker};
 pub use search::{
     RejectedCandidate, SearchExplained, SearchMode, SearchQuery, SearchResult, VectorSearchQuery,
     WhyRetrieved,

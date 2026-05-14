@@ -29,6 +29,7 @@ use ditto_core::{
 
 use crate::embedder::Embedder;
 use crate::extractor::{name_to_node_id, Extractor};
+use crate::reranker::Reranker;
 use crate::search::{
     RejectedCandidate, SearchExplained, SearchMode, SearchQuery, SearchResult,
     VectorSearchQuery, WhyRetrieved,
@@ -197,6 +198,11 @@ pub struct MemoryController<S: Storage> {
     /// in `LongSleep`. Values in (0.0, 1.0) shrink; 1.0 disables decay.
     /// Default 0.95 — a salience of 0.5 hits 0.5 after ~14 sweeps.
     long_sleep_decay: f32,
+    /// Optional late-interaction reranker. When set, `search` calls it
+    /// after RRF + relevance gating + recency blending — so the reranker
+    /// operates on a clean top-K rather than a noisy candidate pool.
+    /// `None` defaults to no rerank (identity).
+    reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl<S: Storage> MemoryController<S> {
@@ -238,6 +244,7 @@ impl<S: Storage> MemoryController<S> {
             alpha_recency: 0.0,
             extractor: None,
             long_sleep_decay: 0.95,
+            reranker: None,
         }
     }
 
@@ -297,6 +304,18 @@ impl<S: Storage> MemoryController<S> {
 
     pub fn long_sleep_decay(&self) -> f32 {
         self.long_sleep_decay
+    }
+
+    /// Attach a late-interaction reranker. Called by `search` after RRF
+    /// fusion, the relevance gate, and recency blending. Pass a `NoopReranker`
+    /// to explicitly opt-in to "no rerank" semantics (otherwise leave None).
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
+    }
+
+    pub fn reranker(&self) -> Option<&Arc<dyn Reranker>> {
+        self.reranker.as_ref()
     }
 
     pub fn with_labile_window(mut self, duration: Duration) -> Self {
@@ -433,17 +452,22 @@ impl<S: Storage> MemoryController<S> {
         let raw = self.run_retrieval(query).await?;
         let resolved = self.resolve_shadows(query.tenant_id, raw).await?;
         let gated = self.apply_recency_blend(self.apply_relevance_gate(resolved));
+        let reranked = if let Some(reranker) = self.reranker.as_ref() {
+            reranker.rerank(&query.query, gated).await
+        } else {
+            gated
+        };
 
         // Open the labile window on every returned event.
         let now = Utc::now();
         let until = now + self.labile_window;
-        for r in &gated {
+        for r in &reranked {
             if let Err(e) = self.storage.open_labile(query.tenant_id, r.event_id, until).await {
                 tracing::warn!(error = %e, "open_labile failed; subsequent update() may reject as not-labile");
             }
         }
 
-        Ok(gated)
+        Ok(reranked)
     }
 
     /// Drop results whose relevance is well below the top result's.
@@ -3386,6 +3410,78 @@ mod tests {
             .unwrap();
         assert!(dream.stub);
         assert!(dream.notes.to_lowercase().contains("no extractor"));
+    }
+
+    // --- Reranker integration ---
+
+    #[tokio::test]
+    async fn search_calls_reranker_when_wired() {
+        use crate::reranker::ReverseReranker;
+        let ctrl = ctrl().with_reranker(Arc::new(ReverseReranker));
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r1 = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "alpha alpha alpha"}),
+                t(2026, 1, 1),
+            )
+            .await
+            .unwrap();
+        let r2 = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "alpha"}),
+                t(2026, 1, 2),
+            )
+            .await
+            .unwrap();
+        // Without the reranker, BM25 puts the higher-frequency match
+        // first. The reverse reranker flips that — so r2 lands first.
+        let q = SearchQuery::new("alpha", tenant);
+        let out = ctrl.search(&q).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event_id, r2.event_id);
+        assert_eq!(out[1].event_id, r1.event_id);
+    }
+
+    #[tokio::test]
+    async fn search_without_reranker_preserves_pipeline_order() {
+        let ctrl = ctrl(); // no reranker
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let r1 = ctrl
+            .write(
+                tenant,
+                scope,
+                "s",
+                Slot::EpisodicIndex,
+                json!({"content": "alpha alpha alpha"}),
+                t(2026, 1, 1),
+            )
+            .await
+            .unwrap();
+        ctrl.write(
+            tenant,
+            scope,
+            "s",
+            Slot::EpisodicIndex,
+            json!({"content": "alpha"}),
+            t(2026, 1, 2),
+        )
+        .await
+        .unwrap();
+        let q = SearchQuery::new("alpha", tenant);
+        let out = ctrl.search(&q).await.unwrap();
+        assert!(!out.is_empty());
+        // Highest-frequency match comes first absent reranking.
+        assert_eq!(out[0].event_id, r1.event_id);
     }
 
     #[tokio::test]
