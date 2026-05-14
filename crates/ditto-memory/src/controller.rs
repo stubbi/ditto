@@ -222,20 +222,18 @@ impl<S: Storage> MemoryController<S> {
             chain_heads: Mutex::new(HashMap::new()),
             embedder: None,
             labile_window: Duration::minutes(5),
-            // Two-knob relevance gate. `min_relative_score` (relative to
-            // top result) handles the easy case — clearly off-topic records.
-            // `min_absolute_cosine` is the floor below which a record is
-            // noise regardless of the top score; this protects the case
-            // where the top result happens to be a soft distractor (a
-            // record more cosine-similar to the *query phrasing* than to
-            // its semantic intent) and the relative-only gate would happily
-            // drop the actually-correct second-place record.
-            //
-            // 0.5 / 0.35 are the values that produce 3/3 on Provenance-
-            // Bench v0 with OpenAI text-embedding-3-small. Tune via the
-            // bench when adding fixtures.
-            min_relative_score: 0.5,
-            min_absolute_cosine: 0.35,
+            // Relevance gate defaults to OFF. The gate is a research dial,
+            // not a production tuning: cosine-score distributions are
+            // workload-specific (Provenance-Bench wants 0.5/0.35, LoCoMo
+            // wants 0.0/0.0), and a fixed prior baked into the controller
+            // becomes load-bearing in unintended ways. The architecturally
+            // honest path to relevance is a late-interaction reranker
+            // (`with_reranker`) that re-orders top-K with proper per-token
+            // semantics — the gate's role shrinks to "drop the tail" and
+            // can be handled by `k` alone. Set non-zero values explicitly
+            // when a workload has been measured to benefit.
+            min_relative_score: 0.0,
+            min_absolute_cosine: 0.0,
             // Recency off by default. Provenance-Bench's two cases pull in
             // opposite directions (prov-001 wants oldest-correct, prov-002
             // wants newest-correct), so any fixed positive value here
@@ -2868,7 +2866,9 @@ mod tests {
 
     #[tokio::test]
     async fn relevance_gate_drops_clearly_unrelated_records() {
-        let ctrl = ctrl_with_embedder();
+        // Gate is off by default; explicitly enable it for this test so
+        // we can assert the dropping behavior independently of the prior.
+        let ctrl = ctrl_with_embedder().with_min_relative_score(0.5);
         let tenant = TenantId::new();
         let scope = ScopeId::new();
         ctrl.write(
@@ -2939,7 +2939,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_surfaces_gate_dropped_records_under_rejected() {
-        let ctrl = ctrl_with_embedder();
+        let ctrl = ctrl_with_embedder().with_min_relative_score(0.5);
         let tenant = TenantId::new();
         let scope = ScopeId::new();
         ctrl.write(

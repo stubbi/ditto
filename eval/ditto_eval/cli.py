@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 from ditto_eval.backends import DittoBackend, StubBackend
 from ditto_eval.backends.base import MemoryBackend
-from ditto_eval.benchmarks import ProvenanceBench
+from ditto_eval.benchmarks import LocomoBench, LocomoConfig, ProvenanceBench
 from ditto_eval.benchmarks.base import Benchmark
 from ditto_eval.runner import run_benchmark
 
@@ -36,10 +36,14 @@ BACKENDS: dict[str, BackendFactory] = {
 
 BENCHMARKS: dict[str, type[Benchmark]] = {
     "provenance": ProvenanceBench,
+    "locomo": LocomoBench,
 }
 
 DEFAULT_FIXTURES = {
     "provenance": Path(__file__).parent.parent / "fixtures" / "provenance" / "v0.yaml",
+    # LoCoMo uses a *directory* as its fixture — the dataset JSON is
+    # downloaded into it on first use, then reused from cache.
+    "locomo": Path(__file__).parent.parent / "fixtures" / "locomo",
 }
 
 
@@ -51,7 +55,7 @@ def main() -> None:
 @main.command()
 @click.option("--benchmark", "-b", type=click.Choice(list(BENCHMARKS)), required=True)
 @click.option("--backend", "-k", type=click.Choice(list(BACKENDS)), required=True)
-@click.option("--fixture", "-f", type=click.Path(exists=True, path_type=Path), default=None)
+@click.option("--fixture", "-f", type=click.Path(path_type=Path), default=None)
 @click.option(
     "--results-dir",
     "-r",
@@ -60,14 +64,83 @@ def main() -> None:
     # land in eval/results/, not <cwd>/results/. Override via `-r`.
     default=Path(__file__).resolve().parent.parent / "results",
 )
-def run(benchmark: str, backend: str, fixture: Path | None, results_dir: Path) -> None:
+@click.option(
+    "--locomo-max-per-cat",
+    type=int,
+    default=None,
+    help="LoCoMo: stratify-sample N questions per category per conversation.",
+)
+@click.option(
+    "--locomo-conversations",
+    type=str,
+    default=None,
+    help="LoCoMo: comma-separated conversation indices (0..9). Default all 10.",
+)
+@click.option(
+    "--locomo-qa-model",
+    type=str,
+    default="openai/gpt-4o-mini",
+    help="LoCoMo: OpenRouter model for the QA solver.",
+)
+@click.option(
+    "--locomo-judge-model",
+    type=str,
+    default="openai/gpt-4o-mini",
+    help="LoCoMo: OpenRouter model for the answer judge.",
+)
+@click.option(
+    "--locomo-top-k",
+    type=int,
+    default=10,
+    help="LoCoMo: retrieval top-k passed to backend.search.",
+)
+@click.option(
+    "--locomo-concurrency",
+    type=int,
+    default=8,
+    help="LoCoMo: concurrent QA in-flight per conversation.",
+)
+@click.option(
+    "--verbose/--quiet",
+    default=False,
+    help="Verbose: print every example. Quiet: print only category aggregates.",
+)
+def run(
+    benchmark: str,
+    backend: str,
+    fixture: Path | None,
+    results_dir: Path,
+    locomo_max_per_cat: int | None,
+    locomo_conversations: str | None,
+    locomo_qa_model: str,
+    locomo_judge_model: str,
+    locomo_top_k: int,
+    locomo_concurrency: int,
+    verbose: bool,
+) -> None:
     """Run a benchmark against a backend."""
     fixture_path = fixture or DEFAULT_FIXTURES[benchmark]
     bench_cls = BENCHMARKS[benchmark]
     backend_cls = BACKENDS[backend]
 
     async def _go() -> None:
-        b = bench_cls(fixture_path)
+        if benchmark == "locomo":
+            convs = (
+                [int(x) for x in locomo_conversations.split(",")]
+                if locomo_conversations
+                else None
+            )
+            cfg = LocomoConfig(
+                max_questions_per_category=locomo_max_per_cat,
+                conversations=convs,
+                top_k=locomo_top_k,
+                qa_model=locomo_qa_model,
+                judge_model=locomo_judge_model,
+                concurrency=locomo_concurrency,
+            )
+            b = bench_cls(fixture_path, config=cfg)
+        else:
+            b = bench_cls(fixture_path)
         bk = backend_cls()  # factory call
         try:
             result = await run_benchmark(b, bk, results_dir=results_dir)
@@ -76,9 +149,16 @@ def run(benchmark: str, backend: str, fixture: Path | None, results_dir: Path) -
         click.echo(f"{result.benchmark} on {result.backend}:")
         click.echo(f"  passed: {result.passed}/{result.total}")
         click.echo(f"  score:  {result.score:.3f}")
-        for e in result.examples:
-            mark = "PASS" if e.passed else "FAIL"
-            click.echo(f"    [{mark}] {e.example_id}  score={e.score:.2f}  {e.details}")
+        per_cat = result.metadata.get("per_category_accuracy")
+        if per_cat:
+            click.echo("  per-category accuracy:")
+            for cat, acc in per_cat.items():
+                acc_s = f"{acc:.3f}" if isinstance(acc, float) else "n/a"
+                click.echo(f"    {cat}: {acc_s}")
+        if verbose:
+            for e in result.examples:
+                mark = "PASS" if e.passed else "FAIL"
+                click.echo(f"    [{mark}] {e.example_id}  score={e.score:.2f}  {e.details}")
 
     asyncio.run(_go())
 

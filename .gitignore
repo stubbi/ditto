@@ -25,3 +25,7 @@ __pycache__/
 # Rust
 target/
 Cargo.lock
+
+# Eval data caches — downloaded on first use, not committed.
+eval/fixtures/locomo/*.json
+eval/results/

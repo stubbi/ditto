@@ -5,6 +5,9 @@ Each benchmark is a `Benchmark` subclass that loads a fixture, drives a
 
 Implemented:
 - `ProvenanceBench` — Ditto-Provenance-Bench, our original fixture
+- `LocomoBench` — LoCoMo (Maharana et al. 2024), the canonical
+  long-conversation memory benchmark. 10 multi-session dialogs, ~2000
+  questions across 5 categories.
 
 Forthcoming:
 - `LongMemEval` — public ICLR 2025 benchmark
@@ -14,6 +17,14 @@ Forthcoming:
 """
 
 from ditto_eval.benchmarks.base import Benchmark, BenchmarkResult, ExampleResult
+from ditto_eval.benchmarks.locomo import LocomoBench, LocomoConfig
 from ditto_eval.benchmarks.provenance import ProvenanceBench
 
-__all__ = ["Benchmark", "BenchmarkResult", "ExampleResult", "ProvenanceBench"]
+__all__ = [
+    "Benchmark",
+    "BenchmarkResult",
+    "ExampleResult",
+    "LocomoBench",
+    "LocomoConfig",
+    "ProvenanceBench",
+]

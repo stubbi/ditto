@@ -103,6 +103,19 @@ enum Cmd {
         /// allergic_to). LLM-driven extractor is a follow-up.
         #[arg(long, default_value = "none")]
         extractor: String,
+        /// Relevance gate: drop results whose fused/cosine score is below
+        /// `min-relative-score × top_score`. Default 0 (off) — the gate is
+        /// workload-specific and should be measured into, not assumed.
+        #[arg(long, default_value_t = 0.0)]
+        min_relative_score: f32,
+        /// Absolute cosine floor — vector hits below this value are dropped
+        /// regardless of the top. Default 0 (off).
+        #[arg(long, default_value_t = 0.0)]
+        min_absolute_cosine: f32,
+        /// Recency blend weight α_recency in [0, 1]. 0 = pure relevance,
+        /// 1 = pure recency.
+        #[arg(long, default_value_t = 0.0)]
+        alpha_recency: f32,
     },
 }
 
@@ -218,12 +231,19 @@ async fn run_cmd<S: Storage + 'static>(
         Cmd::Serve {
             embedder,
             extractor,
+            min_relative_score,
+            min_absolute_cosine,
+            alpha_recency,
         } => {
             // Hand control to the MCP server. Logs go to stderr (configured
             // earlier); stdio is reserved for the JSON-RPC framing.
             let _ = storage; // referenced via ctrl
             let ctrl = build_embedder(ctrl, &embedder)?;
             let ctrl = build_extractor(ctrl, &extractor)?;
+            let ctrl = ctrl
+                .with_min_relative_score(min_relative_score)
+                .with_min_absolute_cosine(min_absolute_cosine)
+                .with_alpha_recency(alpha_recency);
             serve_stdio(Arc::new(ctrl)).await?;
             Ok(())
         }

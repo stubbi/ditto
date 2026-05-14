@@ -76,6 +76,9 @@ class DittoBackend(MemoryBackend):
         binary: Path | None = None,
         embedder: str | None = None,
         extractor: str | None = None,
+        min_relative_score: float | None = None,
+        min_absolute_cosine: float | None = None,
+        alpha_recency: float | None = None,
     ) -> None:
         self._binary = binary or _default_binary()
         # Embedder selection passed to `ditto serve --embedder ...`. Resolution
@@ -105,6 +108,21 @@ class DittoBackend(MemoryBackend):
         if extractor is None:
             extractor = "rule" if self._embedder != "none" else "none"
         self._extractor = extractor
+        # Relevance gate / recency knobs — match the Rust defaults when
+        # not passed; env override for batched bench runs.
+        def _knob(arg: float | None, env: str, default: float) -> float:
+            if arg is not None:
+                return arg
+            v = os.environ.get(env)
+            return float(v) if v else default
+        # Defaults match Rust: gate OFF unless explicitly tuned.
+        self._min_relative_score = _knob(
+            min_relative_score, "DITTO_MIN_RELATIVE_SCORE", 0.0
+        )
+        self._min_absolute_cosine = _knob(
+            min_absolute_cosine, "DITTO_MIN_ABSOLUTE_COSINE", 0.0
+        )
+        self._alpha_recency = _knob(alpha_recency, "DITTO_ALPHA_RECENCY", 0.0)
         self._stack: Any = None
         self._session: ClientSession | None = None
         # Per-backend scope; the eval harness doesn't supply one. Stable so
@@ -126,6 +144,12 @@ class DittoBackend(MemoryBackend):
                 self._embedder,
                 "--extractor",
                 self._extractor,
+                "--min-relative-score",
+                str(self._min_relative_score),
+                "--min-absolute-cosine",
+                str(self._min_absolute_cosine),
+                "--alpha-recency",
+                str(self._alpha_recency),
             ],
             env={**os.environ},
         )
