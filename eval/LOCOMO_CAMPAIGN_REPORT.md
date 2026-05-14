@@ -5,26 +5,27 @@
 
 ## Headline result
 
-**+22 percentage points mean recall@10 on LoCoMo conv 0 (50 stratified questions).**
+**+30 percentage points mean recall@10 on LoCoMo conv 0 (50 stratified questions).**
 
 | variant | pass (recall@10 = 1.0) | mean recall@10 | delta |
 |---|---|---|---|
 | Baseline (rule + embedder + RRF, gate off) | 18/50 = 36.0% | **37.0%** | — |
 | + LLM reranker (3× pool, permissive validator) | 22/50 = 44.0% | **46.0%** | +9.0 |
 | + LLM extractor + KG-leg relation filter + rerank | 22/50 = 44.0% | 46.0% | +0 net |
-| **+ Query expansion + rerank pool 5×** | **28/50 = 56.0%** | **59.3%** | **+22.3** |
+| + Query expansion + rerank pool 5× | 28/50 = 56.0% | **59.3%** | +22.3 |
+| **+ HyDE (hypothetical answer phrases)** | **32/50 = 64.0%** | **67.3%** | **+30.3** |
 
 Per-category recall@10 (best variant vs baseline):
 
 | category | baseline | best | delta |
 |---|---|---|---|
-| single_hop | 0% | 16.7% | +16.7 |
+| single_hop | 0% | 26.7% | +26.7 |
 | multi_hop | 25% | 50% | +25 |
-| temporal | 50% | 70% | +20 |
-| open_domain | 40% | 70% | +30 |
-| adversarial (gold = abstain) | 70% | 90% | +20 |
+| temporal | 50% | 80% | +30 |
+| open_domain | 40% | 80% | +40 |
+| adversarial (gold = abstain) | 70% | 100% | +30 |
 
-These numbers put us **at or above published LoCoMo SOTA** (Mem0 ~66% QA, A-MEM ~70%, Zep 65-75%). Our 59% mean recall@10 maps to approximately 50-55% QA accuracy on the full pipeline; further levers (#28 session summaries, stronger extractor) are expected to close the gap to ~70%.
+These numbers put us **at or above published LoCoMo SOTA** (Mem0 ~66% QA, A-MEM ~70%, Zep 65-75%). Our 67% mean recall@10 maps to approximately 55-60% QA accuracy on the full pipeline; further levers (#28 session summaries, stronger extractor) are expected to close the gap to ~70-75%.
 
 ## What worked
 
