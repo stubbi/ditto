@@ -18,7 +18,7 @@ Ditto's bet: a harness that owns memory coherence, runs with real OS sandboxing,
 
 ## Design pillars
 
-1. **Memory-coherence as a harness boundary.** Ditto is the single writer to memory. Five typed slots (working / episodic / semantic / procedural / reflective) with bi-temporal validity, content-addressed Ed25519-signed receipts, and Postgres-backed crash-consistency. See [`docs/architecture/memory.md`](docs/architecture/memory.md) for the commitment and [`docs/research/memory.md`](docs/research/memory.md) for the landscape research.
+1. **Memory-coherence as a harness boundary.** Ditto is the single writer to memory. Seven typed slots (working / episodic-index / blob-store / NC-graph / NC-doc / procedural / reflective) with bi-temporal validity, SCITT-compliant signed receipts, hippocampal-indexed episodic + content-addressed blob storage, surprise-gated writes, reconsolidation labile windows, three-cadence replay (awake ripple / dream cycle / long sleep), and an RL-trained memory operations policy. See [`docs/architecture/memory.md`](docs/architecture/memory.md) for the v2 commitment and [`docs/research/memory.md`](docs/research/memory.md) for the synthesis across landscape, arxiv frontier, neuroscience, production, and trending research.
 2. **Secure-by-default execution.** macOS Seatbelt, Windows AppContainer, Linux Landlock as enforced defaults. Credential brokering — the agent process never holds raw API keys. Per-tool egress policy.
 3. **Subscription-native model routing.** Claude Code, Codex, ChatGPT OAuth as first-class. BYOK via OpenRouter/LiteLLM as fallback. JIT tool-schema projection — no 14k-token preamble per turn.
 4. **Multi-tenant from line one.** Org / tenant / workspace / agent hierarchy. Per-tenant secret vault. Postgres RLS. Audit log. See [`docs/architecture/multi-tenant.md`](docs/architecture/multi-tenant.md).
@@ -31,9 +31,15 @@ docs/
   architecture/
     multi-tenant.md      data model, tenancy hierarchy, auth, secrets, audit
     importer.md          one-shot import from hermes-agent and openclaw
-    memory.md            five typed slots, write/read path, consolidation, eval
+    memory.md            v2: seven slots, controller, three-cadence replay, eval
   research/
-    memory.md            state of the art in agent memory systems (2025-2026)
+    memory.md            synthesis entry point across all five vectors below
+    memory/
+      landscape.md       Round 1: incumbent landscape (Mem0/Zep/Letta/MemPalace/gbrain)
+      arxiv.md           frontier research papers, 2025-Q4 to 2026-Q2 (~80 citations)
+      biology.md         neuroscience grounding (CLS, hippocampal indexing, etc.)
+      production.md      forensic survey of ~30 deployed AI products
+      trending.md        OSS velocity, practitioner pains/asks, surprise findings
 eval/
   ditto-eval Python package — benchmark harness for memory backends
   (Mem0, Zep, Mastra, MemPalace, gbrain, Ditto). Eval-first: we measure

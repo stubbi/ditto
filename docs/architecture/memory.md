@@ -1,165 +1,284 @@
-# Memory architecture
+# Memory architecture (v2)
 
-Ditto's memory system is the defensible moat. This document is the commitment. Reasoning, benchmarks, and citations are in [`../research/memory.md`](../research/memory.md).
+The architectural commitment for Ditto's memory system. v2 reflects the synthesis of four deep-research vectors (arXiv frontier, neuroscience, production deployments, OSS + practitioner discourse). The research lives in [`../research/memory.md`](../research/memory.md) and its sub-documents.
+
+The v1 draft is preserved in git history. v2 is a substantial refactor — the substrate, slot model, controller, and scope taxonomy have all changed. The defensibility analysis and broad thesis are unchanged.
 
 ## Thesis
 
-Ditto is Pareto-better than every incumbent on the axes power users pay for. No single technique gets us there. The combination does:
+Ditto's memory is **Pareto-better** because the *combination* is hard to copy, not the components:
 
-- **bi-temporal KG** (from Graphiti) → temporal correctness
-- **observational consolidation** (from Mastra OM) → LongMemEval-class retrieval at low token cost
-- **single-writer harness boundary** → linearizability, no torn writes, no multi-writer corruption
-- **content-addressed, Ed25519-signed receipts** → verifiable provenance
-- **Postgres + pgvector + tsvector** → crash-consistency for free, RLS multi-tenancy, no schema treadmill
-- **skills as first-class typed memory with lifecycle** → procedural memory that doesn't rot
-- **eval-as-CI** → regression gates on every PR; benchmarks we ship become the discourse
-
-None of hermes-agent, openclaw, openhuman, mempalace, gbrain, Mem0, Zep, Letta, Hindsight, SuperMemory, or Mastra combine all seven.
+1. **Memory controller, not memory store** — RL-trained operations policy (ADD / UPDATE / DELETE / NOOP / RETRIEVE / CONSOLIDATE) learned from outcome reward, in the lineage of Memory-R1 (arXiv 2508.19828) and Mem-α (arXiv 2509.25911). Production parallel: Cursor 2.0 Composer's RL-trained self-summarization.
+2. **Hippocampal-indexed episodic + content-addressed blob store** — episodic is sparse-keyed pointers, content lives in a CAS blob store. ~100× cheaper, matches both biology (Teyler & DiScenna 1986; Liu/Ramirez/Tonegawa 2012) and production (Anthropic Memory MCP, Cursor caches).
+3. **Bi-temporal KG + filesystem-as-memory (NC-doc)** — typed property graph with `t_valid/t_invalid/t_created/t_expired` for facts, plus compiled per-entity Markdown pages that operators can read, edit, version-control, and export.
+4. **Surprise-gated writes + reconsolidation labile windows + schema-fit consolidation** — three biological invariants none of Mem0/Zep/Letta/Mastra/MemPalace/gbrain/Hindsight ship.
+5. **Three-cadence replay** — awake ripples (between turns), dream cycle (session-close + 24h), long sleep (daily/weekly). Salience-prioritized, with TMR cueing.
+6. **SCITT-compliant signed receipts + verifiable cascade deletion** — every write produces a COSE-signed Merkle-anchored receipt (draft-ietf-scitt-architecture-22); every delete is cryptographically attestable and propagates to derived records. EU AI Act August 2026 timeline assumes you have this.
+7. **Single-writer harness boundary on a Postgres substrate** — linearizable writes, crash-consistency via WAL, no torn writes, no multi-writer corruption. The MemPalace #1497 failure mode is impossible by construction.
+8. **Harvey 4-layer scope taxonomy** — personal / matter / institutional / client-institution scopes between Workspace and Tenant. Each with own retention, sharing, and audit defaults. Hard to retrofit.
+9. **Eval-as-CI with Pareto-honest baselines** — LongMemEval, BEAM, MemoryAgentBench, AMA-Bench, Ditto-Provenance-Bench, Ditto-Isolation-Bench, Ditto-DRM-Bench, Ditto-Deletion-Bench, all with matched-conditions BM25 baselines (post-MemPalace methodology event).
+10. **Zero-infra deploy mode** — single-binary + SQLite for solo devs; full Postgres for tenants. One on-disk format both can produce/consume.
 
 ## Slots
 
-Five typed slots. The data model does not grow beyond this. New use cases fit existing slots or get rejected.
+Seven typed memory slots. The data model does not grow beyond this.
 
-| Slot | Lifetime | Mutability | Provenance | Notes |
-|---|---|---|---|---|
-| **Working** | end-of-turn | rw | none | In-context scratchpad. Not durable. Not retrievable. |
-| **Episodic** | forever | append-only | content-addressed | Raw events: observations, tool calls, user turns. Immutable. SHA-256 PK. |
-| **Semantic** | forever (supersession) | bi-temporal | linked to episodic events that produced it | Distilled facts. `(t_created, t_expired, t_valid, t_invalid)`. Contradiction = invalidate, never delete. |
-| **Procedural** | until deprecated | rw | linked to creator | Skills. Lifecycle: active → deprecated → archived. Auto-GC by metabolism rules. |
-| **Reflective** | forever (supersession) | bi-temporal | linked to source events + consolidation receipt | Higher-order observations from the dream cycle. Auditable as derived. |
+| Slot | Lifetime | Mutability | Storage | Biological analog | Notes |
+|---|---|---|---|---|---|
+| **Working** | end-of-turn | rw | in-context structured block | Baddeley focus / Cowan focus | Goal, sub-goal, hypothesis, last K observations. Rendered deterministically into the prompt. |
+| **Episodic-index** | forever | append-only | Postgres episodic table | Hippocampal index | `{event_id, t, source_id, sparse_keys[], salience, content_hash[], context}`. Pointers only. SHA-256 PK. |
+| **Blob-store** | forever (CAS) | append-only | content-addressed object store (S3 / fs) | Cortical content patterns | Verbatim transcripts, tool outputs, file diffs, raw inputs. Keyed by SHA-256 of canonical bytes. Idempotent. |
+| **NC-graph** | forever (supersession) | bi-temporal | Postgres tables (nodes + edges + temporal cols) | Neocortical schemas | Typed property graph. `(t_created, t_expired, t_valid, t_invalid)`. Contradictions invalidate via `t_invalid`. Edges have BCM-normalized strength scalars. |
+| **NC-doc** | forever (supersession) | rw | filesystem (Markdown pages per entity) | Cortical "compiled truth" | Operator-visible. Regenerated by dream cycle from NC-graph + episodic provenance. Exportable. Anthropic Memory MCP compatible. |
+| **Procedural** | until deprecated | rw | filesystem (skill packages) + index in Postgres | Procedural memory | Skills with lifecycle: active → deprecated → archived. Metabolism rules (last_used, tests_pass) drive auto-GC. |
+| **Reflective** | forever (supersession) | bi-temporal | Postgres + NC-doc | Higher-order cortical representations | Consolidator-derived. Auditable as derived. Linked to source events + consolidation receipt. |
+| *(optional)* **SDM-assoc** | forever | rw | sparse high-dim hash table | Pattern completion | Side channel for fragment-cued recall. Not required for v0. |
 
-The reflective/semantic split keeps the user-provided record clean from consolidator-generated content. Anyone auditing the system can tell what the user said vs. what Ditto inferred.
+The split of **NC-graph** (typed structure) and **NC-doc** (rendered Markdown) is deliberate. The graph is what the system queries; the doc is what the operator reads. They're kept synchronized by the consolidator and the doc is always regenerable from the graph + episodic provenance.
 
-## Write path
+## MemoryController
 
-**The harness is the only writer.** Agents emit events; the harness commits them.
+The controller is the moat. It implements the operations policy across all read/write paths.
 
 ```
-agent.emit(Event) ─┐
-                   ▼
-          harness.receive(Event)
-                   │
-                   ├── event_id = sha256(canonical_json(event))   # content address
-                   ├── prev_id = head of tenant's event chain
-                   ├── signature = ed25519_sign(install_key, (event_id, prev_id, ts))
-                   ├── BEGIN
-                   │   INSERT INTO episodic (event_id, prev_id, tenant_id, payload, signature, ts)
-                   │   UPDATE chain_head
-                   │   COMMIT     # WAL fsync handles durability
-                   ├── return Receipt { event_id, prev_id, signature, ts }
-                   ▼
-        async consolidator queue
+                ┌─────────────────────────────────────────────────────────┐
+                │                  MemoryController                       │
+                ├─────────────────────────────────────────────────────────┤
+   agent ─►──── │  write_path:   predict → score salience → gate → emit   │ ──► single-writer commit
+                │  read_path:    metacog gate → mode selection → query    │
+                │  consolidator: awake ripple / dream cycle / long sleep  │
+                │  policy:       RL-trained ops (Memory-R1 / Mem-α)       │
+                └─────────────────────────────────────────────────────────┘
 ```
 
-Properties:
+### Write path
 
-- **Linearizable** — Postgres advisory lock per `(tenant_id, source_id)` serializes writes within a source.
-- **Idempotent** — re-emitting the same event hits the content-addressed PK; no duplicate, returns the existing receipt.
-- **Crash-consistent** — Postgres WAL. Power loss mid-write leaves either committed or not, never half.
-- **Auditable** — every write produces a signed receipt with `prev_id`, forming a per-tenant hash chain. Tampering is detectable offline by any holder of the install's public key.
-- **Replayable** — episodic is append-only and content-addressed. The entire semantic + reflective + procedural state can be regenerated from episodic + consolidator config.
+1. **Predict.** Before commit, query NC-graph: "given this context, what did we expect?" Compute encoder log-likelihood residual against actual content.
+2. **Score salience.** `salience = w1·surprise + w2·reward_signal + w3·explicit_user_flag + w4·outcome_delta`. Surprise is the encoder residual; reward is downstream task outcome when available.
+3. **Always commit Episodic-index + Blob-store.** Blob write is idempotent on SHA-256 PK. Episodic-index row is cheap. Both are append-only, content-addressed, signed.
+4. **Salience gate for NC promotion.** Below threshold τ, the episodic record exists but won't be replayed. Above τ, queue for next awake ripple.
+5. **No immediate NC write.** Defer extraction to consolidation (avoids the Mem0 schema-distortion failure mode).
+6. **Receipt.** Every commit produces a SCITT-compliant receipt: `(event_id, prev_event_id, tenant_id, scope, signature, ts, schema_version)`. Receipts form a per-(tenant, source) Merkle chain.
 
-## Read path
+### Read path
 
-Three retrieval modes. Agents pick per query; default is `standard`.
+1. **Metacognitive gate (RSCB-MC, arXiv 2604.27283).** Contextual bandit decides whether to retrieve at all. Saves 30-50% of retrievals on cheap queries.
+2. **Mode selection.** Three modes:
+   - **`cheap`**: BM25 (tsvector) + KG entity exact-match. p50 < 5ms. No LLM calls.
+   - **`standard`**: BM25 + pgvector HNSW + KG → RRF fusion → late-interaction rerank (ColBERTv2 / MUVERA) top-50 → KG 1-hop expansion. p50 < 50ms. No LLM on hot path.
+   - **`deep`**: standard + query expansion (small LLM, async-prefetched) + cross-encoder rerank + multi-hop KG. p50 ~200ms.
+3. **Final score.** `score = α_recency · recency + α_importance · importance + α_relevance · relevance + α_schema · schema_fit` (Park et al. 2023 with schema-fit added). Weights learned per-tenant.
+4. **Reconsolidation labile window.** Each returned record enters a bounded labile window (default: 5 turns or 5 minutes). During the window, corrections from *trusted sources* (user input, verified tool outputs, explicit `memory.update`) rewrite the trace. Untrusted continuations (the model's own subsequent reasoning) do not. This is the prompt-injection mitigation.
+5. **Retrieval-induced suppression.** Near-neighbors of the winner take a small salience hit, decaying over hours. Prevents future interference; accelerates retrieval for canonical exemplars.
+6. **Explainable retrieval.** Every search returns `{results, why_retrieved, rejected_candidates, scoring_breakdown, confidence, mode_used, abstained?}`. This is a first-class API, not debug-only.
 
-| Mode | Stages | p50 budget | LLM calls (hot path) | When to use |
-|---|---|---|---|---|
-| `cheap` | BM25 (tsvector) + KG entity exact-match | < 5 ms | 0 | ID lookups, recent-fact recall, deterministic tool inputs |
-| `standard` | BM25 + pgvector HNSW → RRF → ColBERT-class rerank top-50 → KG 1-hop expansion | < 50 ms | 0 | Default for agent turns |
-| `deep` | standard + LLM query expansion (async prefetch) + cross-encoder rerank + multi-hop KG | ~200 ms | 1 (expansion, async) | Hard multi-hop questions; auto-escalated when standard returns low confidence |
+### Consolidation
 
-Final ranking: `score = α_recency · recency + α_importance · importance + α_relevance · relevance` (Park et al.). Weights are learned per-tenant offline; defaults are hardcoded.
+Three cadences, all background, none on the latency-critical path.
 
-## Consolidation
+**Awake ripple** (between turns, ≤200ms budget, in-process):
+- Replay top-K episodic records by `salience × recency_decay`.
+- For each, cheap schema-fit check against NC-graph.
+- Fits: tag for fast NC commit in next dream cycle. Bump salience.
+- Doesn't fit: leave in HC, accumulate corroboration.
 
-Two background cadences. Neither blocks the hot path.
+**Dream cycle** (session-close + 24h, off-process, seconds–minutes budget):
+- Observer agent (Mastra OM pattern): compresses unobserved episodic into traffic-light-tagged observations.
+- Reflector agent: promotes high-confidence observations into reflective records.
+- For ripple-tagged episodes:
+  - Schema-fit path: single-LLM-call extractor proposes facts; Graphiti-style contradiction check; on contradiction, invalidate prior via `t_invalid`; ADM-style counterfactual verification before commit.
+  - Novel path: defer to next cycle; require N corroborating episodes before NC commit; flag for schema revision proposal.
+- Regenerate affected NC-doc pages.
+- Skill metabolism: skills with `last_used > 30d` or `tests_pass < 0.7` → deprecated.
 
-- **Online consolidator** — fires every N=20 episodic events. Single-LLM-call extractor (Mem0-style single-pass) proposes semantic candidates. Each candidate runs the Graphiti contradiction check against existing semantic edges; contradictions invalidate the prior edge via `t_invalid`. All writes are receipt-signed.
-- **Dream cycle** — fires at session close and every 24h per tenant. Observer/Reflector pair (Mastra OM pattern): Observer compresses recent episodic into traffic-light-tagged observations; Reflector promotes high-confidence observations into reflective records. ADM-style counterfactual verification runs before commit. Skill metabolism runs here: skills with `last_used > 30d` or `tests_pass < 0.7` are marked deprecated.
+**Long sleep** (daily/weekly, off-process):
+- Decay sweep on episodic salience.
+- Retrieval-induced suppression on NC-graph near-neighbors.
+- Cold-subgraph archival.
+- Conflict detection across NC claims; surface to human review (no auto-resolve below confidence threshold).
+- Spaced-retrieval self-testing (Roediger & Karpicke 2006) on high-importance claims: agent self-queries; correct recall strengthens, miss re-encodes.
 
-Failure modes are handled explicitly:
-- Consolidator crash mid-cycle: queue is durable; restart resumes.
-- LLM extraction error: episodic write is unaffected; consolidator failure is logged and retried with exponential backoff.
-- Contradiction-check ambiguity: surface to a human review queue (per gbrain #1539); never auto-resolve below confidence threshold.
+**TMR cueing**. User/harness can bias the next dream cycle: `memory.tmr(focus="auth refactor", hint="prioritize episodes involving security review")`. Biological precedent: Rasch et al. 2007.
+
+### Policy
+
+Operations policy is learned, not hardcoded. Initial implementation:
+- Memory-R1 / Mem-α RL recipe: GRPO over composite outcome reward (task success + retrieval quality + cost). 152-QA-pair training set is sufficient as a baseline.
+- Policy actions: `WRITE_EPISODIC`, `WRITE_NC_FAST` (schema fits), `WRITE_NC_DEFERRED` (novel, accumulate), `UPDATE` (via reconsolidation window), `INVALIDATE` (bitemporal supersede), `DELETE` (verifiable cascade), `RETRIEVE_{cheap,standard,deep}`, `ABSTAIN`, `CONSOLIDATE_NOW`, `NOOP`.
+- Policy is per-tenant tunable (different workloads — coding, support, research — have different defaults via presets).
+
+## Scope taxonomy
+
+```
+Org
+└── Tenant                 isolation, encryption, audit, billing boundary
+    ├── Institutional      org-wide processes, conventions, templates (read-mostly)
+    └── Workspace          project / RBAC scope
+        ├── Matter         per-engagement scope, retention-policied
+        ├── Agent          runtime instance with persona, model, channels
+        │   └── Subagent   role-scoped persistent drawer (Claude Code pattern)
+        └── Source         per-Composio-connector / per-MCP-server isolation
+```
+
+Each scope has independent defaults for:
+- Retention (Working: end-of-turn; Matter: per-engagement policy; Institutional: forever; etc.)
+- Sharing (Institutional: read by all in Tenant; Matter: restricted to Matter members; Subagent: write by owner, read by parent)
+- Audit (every scope gets its own audit partition)
+- Encryption (Tenant-level KMS keys; per-Matter envelope keys optional)
+
+Source-scoped retrieval is first-class: `memory.search(scope=["matter:acme-v-globex"])`. Federation across scopes is an explicit operation with its own audit event.
 
 ## Storage substrate
 
-**Postgres + pgvector + tsvector. SQLite + sqlite-vec for embedded. No bespoke storage.**
+**Postgres + pgvector + tsvector + filesystem (NC-doc + Blob-store).** SQLite + sqlite-vec for embedded mode. No bespoke storage.
 
-Schema discipline (to avoid gbrain's 30+ migration issues):
+Tables (initial schema):
 
-- **Additive-only.** Columns are added with defaults; never dropped. Removed columns get a `_deprecated_` prefix; the application stops reading them; the column lives forever.
-- **View layer for compat.** All application queries go through views named for the API contract, not the table. Underlying tables can evolve; views absorb the change.
-- **Format versioning in the receipt.** Each receipt records the schema version that produced it. Old receipts remain replayable forever; new code can reinterpret them.
+```sql
+-- Episodic: sparse index, pointers only
+CREATE TABLE episodic (
+    event_id        bytea PRIMARY KEY,           -- sha256(canonical_json(payload))
+    prev_event_id   bytea REFERENCES episodic(event_id),
+    tenant_id       uuid NOT NULL,
+    scope_id        uuid NOT NULL,
+    source_id       text NOT NULL,
+    content_hash    bytea[] NOT NULL,             -- pointers into blob_store
+    sparse_keys     bytea[],                      -- pattern-completion side channel
+    salience        real NOT NULL,
+    context         jsonb,
+    ts              timestamptz NOT NULL,
+    signature       bytea NOT NULL,               -- SCITT receipt sig
+    schema_version  int NOT NULL
+);
+-- Bi-temporal semantic facts
+CREATE TABLE nc_node (
+    node_id         uuid PRIMARY KEY,
+    tenant_id       uuid NOT NULL,
+    scope_id        uuid NOT NULL,
+    type            text NOT NULL,
+    properties      jsonb NOT NULL,
+    t_created       timestamptz NOT NULL,
+    t_expired       timestamptz,
+    t_valid         timestamptz NOT NULL,
+    t_invalid       timestamptz,
+    provenance      bytea[] NOT NULL              -- episodic event_ids
+);
+CREATE TABLE nc_edge (
+    edge_id         uuid PRIMARY KEY,
+    src             uuid REFERENCES nc_node,
+    dst             uuid REFERENCES nc_node,
+    rel             text NOT NULL,
+    strength        real NOT NULL DEFAULT 0.1,    -- BCM-updated
+    t_created       timestamptz NOT NULL,
+    t_expired       timestamptz,
+    t_valid         timestamptz NOT NULL,
+    t_invalid       timestamptz,
+    provenance      bytea[] NOT NULL
+);
+-- Procedural (skills) — content on filesystem, index here
+CREATE TABLE procedural (
+    skill_id        text PRIMARY KEY,
+    tenant_id       uuid NOT NULL,
+    scope_id        uuid NOT NULL,
+    version         text NOT NULL,
+    path            text NOT NULL,                -- filesystem path
+    last_used       timestamptz,
+    tests_pass      real,
+    status          text NOT NULL                 -- active / deprecated / archived
+);
+-- Receipts — Merkle-chained per (tenant, source)
+CREATE TABLE receipt (
+    event_id        bytea PRIMARY KEY,
+    prev_event_id   bytea,
+    tenant_id       uuid NOT NULL,
+    source_id       text NOT NULL,
+    schema_version  int NOT NULL,
+    cose_signature  bytea NOT NULL,
+    merkle_root     bytea,                        -- periodically anchored
+    ts              timestamptz NOT NULL
+);
+```
 
-Index plan:
-- HNSW on every vector column with `tenant_id` as a leading partial-index column for hot tenants.
-- GIN on `tsvector` for BM25.
-- B-tree on `(tenant_id, source_id, ts)` for time-range scans.
+RLS on every table by `tenant_id`. Per-tenant connection role for hot tenants. Database-per-tenant escape hatch for regulated workloads.
 
-Scaling beyond ~50M vectors/tenant: swap pgvector HNSW for pgvector DiskANN when GA; or partition per-tenant into per-tenant schemas with shared role; or shell out to Milvus/Qdrant via the same retrieval port. The data model does not change.
+Schema discipline (avoid gbrain's 30+ migration issues):
+- **Additive only.** Columns get `_deprecated_` prefix, never dropped.
+- **Views for compat.** Application reads through versioned views.
+- **Format version in receipts.** Old receipts always replayable.
 
-## Multi-tenancy
+## Distribution
 
-Lives at the schema level; see [`multi-tenant.md`](./multi-tenant.md) for the full hierarchy.
+Three transports, one core. All transports produce identical signed receipts.
 
-- Every memory row carries `tenant_id`. RLS enforces. Application sets `app.tenant_id` per request.
-- Every episodic event carries `source_id` (per-Composio-connector, per-MCP-server, per-channel). Retrieval supports source-scoped queries.
-- Federation: per-region installs share a key directory; cross-region queries fan out, each install signs its result, federator verifies before merging.
-- Regulated tenants get database-per-tenant via config flag. Same code path.
-
-## Integration surface
-
-One Rust core, three transports. All transports go through the same write-path validation and produce the same signed receipts.
-
-- **In-process SDK** — Rust core with Python/TS bindings. Zero serialization overhead. Used by Ditto agents.
-- **MCP server** — `ditto memory` exposed as MCP tools (search, write, list_sources, get_receipt, verify_receipt). Lingua franca for Claude Code, Cursor, third-party harnesses.
-- **HTTP API + sidecar daemon** — for multi-agent, multi-process deployments where Ditto is not the only consumer. Daemon mediates writes so single-writer invariant holds.
+- **In-process SDK** — Rust core, Python/TS bindings (PyO3, napi-rs). Zero serialization. Used by Ditto agents.
+- **MCP server** — Anthropic Memory MCP-compatible surface plus Ditto extensions. Lingua franca for Claude Code, Cursor, Zed, Copilot. Import/export Anthropic's `/memories` JSONL format.
+- **HTTP API + sidecar daemon** — for multi-agent, multi-process deployments. Daemon mediates writes so single-writer invariant holds.
+- **Single-binary mode** — engram/Memvid-inspired. One Rust binary, SQLite + filesystem only, no Postgres. For solo devs and edge.
 
 Tools exposed on every transport:
 
 ```
-memory.write(slot, payload, source_id?, capability_token) → Receipt
-memory.search(query, mode=cheap|standard|deep, scope?, k?) → [Record + provenance]
-memory.get(event_id) → Record
+memory.write(slot, payload, scope, source_id?) → Receipt
+memory.update(event_id, patch, authority?) → Receipt    # respects labile window
+memory.invalidate(node_id, t_invalid) → Receipt          # bitemporal supersede
+memory.delete(node_id, cascade=true) → DeletionProof     # verifiable
+memory.search(query, scope, mode=cheap|standard|deep, k=10) → SearchResult
+memory.explain(query_id) → ExplainResult                 # why retrieved
+memory.consolidate(scope, mode=ripple|dream|long_sleep, focus?) → ConsolidationReport
+memory.tmr(scope, focus, hint?) → None                   # bias next dream cycle
 memory.verify(receipt) → bool
-memory.list_sources(tenant_id) → [Source]
-memory.consolidate(tenant_id, dry_run=false) → ConsolidationReport
+memory.export(scope, format=anthropic|jsonl|markdown) → Stream
+memory.import(source, format, dedup_policy) → ImportReport
 ```
 
-## Eval
+## Eval surface
 
-In-tree, regression-gated on every PR. Failures block merge.
+Ship in-tree. Regression-gated on every PR.
 
-| Suite | Where | Frequency | Floor |
+| Suite | Source | Frequency | Floor |
 |---|---|---|---|
-| LongMemEval-M | `eval/longmemeval/` | every PR | 90% across gpt-4o, gpt-5-mini, opus-4.7, sonnet-4.7 |
-| BEAM-1M subset | `eval/beam/` | every PR | 65% |
-| BEAM-10M full | `eval/beam/` | nightly | 48% |
-| Ditto-Provenance-Bench | `eval/provenance/` | every PR | recall ≥ 0.95 |
-| Ditto-Isolation-Bench | `eval/isolation/` | every PR | leak rate = 0 |
-| Crash-consistency suite | `eval/crash/` | every PR | 0 lost-acknowledged writes, 0 torn writes, 0 broken hash chains |
+| LongMemEval-M | arXiv 2410.10813 | every PR | 90% across gpt-4o, gpt-5-mini, opus-4.7, sonnet-4.7 |
+| BEAM-1M subset | arXiv 2510.27246 | every PR | 65% |
+| BEAM-10M full | arXiv 2510.27246 | nightly | 48% |
+| MemoryAgentBench | ICLR 2026 | every PR | top quartile across 4 competencies |
+| AMA-Bench | ICLR 2026 | nightly | beat the published AMA-Agent baseline |
+| Ditto-Provenance-Bench | Ditto-original | every PR | recall ≥ 0.95 |
+| Ditto-Isolation-Bench | Ditto-original | every PR | leak rate = 0 |
+| Ditto-DRM-Bench | Ditto-original | every PR | false-recall rate < 0.05 (DRM) |
+| Ditto-Deletion-Bench | Ditto-original | every PR | cascade completeness = 1.0 |
+| Crash-consistency suite | Ditto-original | every PR | 0 lost-acknowledged writes, 0 torn writes, 0 broken hash chains |
 
-Provenance-Bench and Isolation-Bench are Ditto-original. Publishing them is part of the positioning: competitors must either run them (catching up to us) or argue they don't matter (losing on the dimensions enterprise buyers care about).
+**Pareto-honest reporting** — every published result includes a matched-conditions BM25 baseline on the same haystack at full corpus scale (post-MemPalace #214 methodology bar).
 
 ## What this architecture deliberately does not do
 
-- **No CRDT-style multi-writer.** A multi-writer system can't be linearizable; it gives up exactly the property that prevents mempalace-style corruption.
-- **No bespoke vector store.** Every memory startup that built one bled out on durability bugs.
-- **No silent semantic deletion.** Contradictions invalidate; users can always see what was once true.
-- **No retrieval that returns un-provenanced results.** Every record carries its episodic source set.
-- **No skill auto-creation without a quality gate.** Hermes #13265's first flaw. Skills are created with explicit user intent or after a passing test, never by a mechanical timer.
+- **No CRDT-style multi-writer.** Linearizability is the moat.
+- **No bespoke vector store.** pgvector + sqlite-vec only.
+- **No silent semantic deletion.** Bitemporal supersession; deletes are verifiable + audited.
+- **No un-provenanced retrieval results.** Every record cites its episodic source set.
+- **No skill auto-creation without a quality gate** (hermes #13265 flaw 1).
+- **No write-time fact extraction** (Mem0 schema-distortion failure mode).
+- **No retrieval-on-every-turn** (RSCB-MC saves 30-50%).
+- **No embeddings as load-bearing primary retrieval** (Supermemory & ByteRover proved you don't need them).
+- **No parametric model editing as primary memory** (MEMIT degrades after ~40 edits).
+- **No naive 1M-token long-context as memory** (~1250× cost vs RAG).
 
-## Open questions
+## Open questions (re-evaluate at month 6)
 
-- Multi-agent shared memory: does the single-writer invariant force a daemon hop for every multi-agent shared-memory use case? Re-evaluate at month 6 with real workload data.
-- Bi-temporal cost on the hot path: how much can we batch contradiction checks into the dream cycle without retrievable-stale-fact windows growing unacceptable? Need benchmarks against simulated multi-update workloads.
-- Receipt key management: rotation, compromise recovery, federation key directory — designed but not yet specified.
-- DiskANN-in-pgvector GA timing: drives whether we ship Milvus/Qdrant fallback in v0 or v1.
+- **Multi-agent shared memory.** Does the single-writer invariant force a daemon hop for every shared-memory use case? Measure under real workloads.
+- **Bi-temporal contradiction cost.** How much can we batch contradiction checks into the dream cycle before stale-fact windows grow unacceptable?
+- **Hyperscale: pgvector vs DiskANN GA timing.** May need Milvus/Qdrant fallback in v1.
+- **Receipt key management.** Rotation, compromise recovery, federation key directory.
+- **Hypernetwork LoRA path (Doc-to-LoRA / SHINE).** Only viable if we control the base model. Worth building the data pipeline that would feed it.
+- **Voice agent latency budget.** Sub-100ms retrieval and streaming write API — defer to v1 but design the API to accept it.
 
 ## Related
 
-- [`../research/memory.md`](../research/memory.md) — full landscape research with citations
-- [`./multi-tenant.md`](./multi-tenant.md) — tenancy hierarchy and RLS model
-- [`./importer.md`](./importer.md) — how hermes/openclaw state maps into these slots
+- [`../research/memory.md`](../research/memory.md) — synthesis entry point
+- [`../research/memory/landscape.md`](../research/memory/landscape.md) — Round 1 landscape
+- [`../research/memory/arxiv.md`](../research/memory/arxiv.md) — frontier research
+- [`../research/memory/biology.md`](../research/memory/biology.md) — neuroscience grounding
+- [`../research/memory/production.md`](../research/memory/production.md) — what's actually deployed
+- [`../research/memory/trending.md`](../research/memory/trending.md) — OSS velocity + practitioner discourse
+- [`./multi-tenant.md`](./multi-tenant.md) — tenancy hierarchy (to be updated for Harvey 4-layer scope)
+- [`./importer.md`](./importer.md) — hermes/openclaw migration
