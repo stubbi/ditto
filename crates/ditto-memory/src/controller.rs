@@ -21,8 +21,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ditto_core::{
-    Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId,
-    SchemaVersion, Slot, TenantId, CURRENT_SCHEMA_VERSION,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, Node, NodeId,
+    Receipt, ScopeId, SchemaVersion, Slot, TenantId, CURRENT_SCHEMA_VERSION,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -188,6 +188,26 @@ impl<S: Storage> MemoryController<S> {
         t_invalid: DateTime<Utc>,
     ) -> StorageResult<()> {
         self.storage.invalidate_edge(edge_id, t_invalid).await
+    }
+
+    // --- Blob store ---
+
+    /// Store a blob in the tenant's CAS. Idempotent on the SHA-256 of the
+    /// blob bytes.
+    pub async fn put_blob(&self, tenant_id: TenantId, blob: &Blob) -> StorageResult<BlobHash> {
+        self.storage.put_blob(tenant_id, blob).await
+    }
+
+    pub async fn get_blob(
+        &self,
+        tenant_id: TenantId,
+        hash: BlobHash,
+    ) -> StorageResult<Option<Blob>> {
+        self.storage.get_blob(tenant_id, hash).await
+    }
+
+    pub async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
+        self.storage.has_blob(tenant_id, hash).await
     }
 }
 
@@ -664,5 +684,72 @@ mod tests {
         let results = ctrl.search(&q).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("birthday"));
+    }
+
+    // --- Blob store ---
+
+    #[tokio::test]
+    async fn blob_put_returns_sha256_of_bytes() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let blob = Blob::text("hello");
+        let hash = ctrl.put_blob(tenant, &blob).await.unwrap();
+        // Same constant as ditto-core's `matches_known_sha256` test — cross-
+        // crate evidence that the hashing surface agrees end-to-end.
+        assert_eq!(
+            hash.to_hex(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_put_is_idempotent_on_identical_bytes() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let blob = Blob::text("hello");
+        let h1 = ctrl.put_blob(tenant, &blob).await.unwrap();
+        let h2 = ctrl.put_blob(tenant, &blob).await.unwrap();
+        assert_eq!(h1, h2);
+        let got = ctrl.get_blob(tenant, h1).await.unwrap().unwrap();
+        assert_eq!(got.bytes, b"hello");
+    }
+
+    #[tokio::test]
+    async fn blob_isolation_across_tenants() {
+        // Two tenants writing identical bytes are independent. A read from
+        // tenant_b for tenant_a's hash returns None — even though the hash
+        // is intrinsic to the bytes.
+        let ctrl = ctrl();
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let blob = Blob::text("shared bytes");
+        let h = ctrl.put_blob(tenant_a, &blob).await.unwrap();
+        assert!(ctrl.has_blob(tenant_a, h).await.unwrap());
+        assert!(!ctrl.has_blob(tenant_b, h).await.unwrap());
+        assert!(ctrl.get_blob(tenant_b, h).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_content_type_round_trips() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let blob = Blob::new(b"{\"x\":1}".to_vec(), "application/json");
+        let h = ctrl.put_blob(tenant, &blob).await.unwrap();
+        let got = ctrl.get_blob(tenant, h).await.unwrap().unwrap();
+        assert_eq!(got.content_type, "application/json");
+        assert_eq!(got.bytes, b"{\"x\":1}");
+    }
+
+    #[tokio::test]
+    async fn blob_reset_purges_tenant_blobs() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let h = ctrl
+            .put_blob(tenant, &Blob::text("doomed"))
+            .await
+            .unwrap();
+        assert!(ctrl.has_blob(tenant, h).await.unwrap());
+        ctrl.reset(tenant).await.unwrap();
+        assert!(!ctrl.has_blob(tenant, h).await.unwrap());
     }
 }

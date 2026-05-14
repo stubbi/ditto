@@ -30,7 +30,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use ditto_core::{
-    EdgeId, NewEdge, NewNode, NodeId, Receipt, ScopeId, Slot, SupersedePolicy, TenantId,
+    Blob, BlobHash, EdgeId, NewEdge, NewNode, NodeId, Receipt, ScopeId, Slot, SupersedePolicy,
+    TenantId,
 };
 #[cfg(test)]
 use ditto_core::InstallKey;
@@ -142,6 +143,23 @@ pub struct EdgesFromAtParams {
 pub struct InvalidateEdgeParams {
     pub edge_id: String,
     pub t_invalid: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PutBlobParams {
+    pub tenant: String,
+    /// Base64-encoded payload bytes.
+    pub bytes_b64: String,
+    /// Optional MIME hint. Defaults to application/octet-stream.
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetBlobParams {
+    pub tenant: String,
+    /// Lowercase hex SHA-256 of the blob payload (64 chars).
+    pub hash: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -288,6 +306,56 @@ impl<S: Storage + 'static> DittoMcpServer<S> {
         ok_json(&serde_json::json!({"ok": true}))
     }
 
+    #[tool(description = "Store a blob in the tenant's content-addressed store. Idempotent on SHA-256 of bytes. Returns {hash, bytelen, content_type}.")]
+    async fn put_blob(
+        &self,
+        params: Parameters<PutBlobParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let tenant = parse_tenant(&p.tenant)?;
+        let bytes = b64_decode(&p.bytes_b64)?;
+        let blob = Blob::new(
+            bytes,
+            p.content_type
+                .unwrap_or_else(|| "application/octet-stream".into()),
+        );
+        let bytelen = blob.bytes.len();
+        let content_type = blob.content_type.clone();
+        let hash = self
+            .ctrl
+            .put_blob(tenant, &blob)
+            .await
+            .map_err(storage_err)?;
+        ok_json(&serde_json::json!({
+            "hash": hash.to_hex(),
+            "bytelen": bytelen,
+            "content_type": content_type,
+        }))
+    }
+
+    #[tool(description = "Fetch a blob by hash from the tenant's content-addressed store. Returns {hash, bytes_b64, content_type} or null when absent.")]
+    async fn get_blob(
+        &self,
+        params: Parameters<GetBlobParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let tenant = parse_tenant(&p.tenant)?;
+        let hash = BlobHash::from_hex(&p.hash).map_err(|e| bad_arg(format!("hash: {e}")))?;
+        let blob = self
+            .ctrl
+            .get_blob(tenant, hash)
+            .await
+            .map_err(storage_err)?;
+        match blob {
+            Some(b) => ok_json(&serde_json::json!({
+                "hash": hash.to_hex(),
+                "content_type": b.content_type,
+                "bytes_b64": b64_encode(&b.bytes),
+            })),
+            None => ok_json(&serde_json::Value::Null),
+        }
+    }
+
     #[tool(description = "Verify a receipt's signature against the original event. Returns {valid: bool}.")]
     async fn verify_receipt(
         &self,
@@ -380,6 +448,72 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
+const B64_ALPH: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            if chunk.len() > 1 { chunk[1] } else { 0 },
+            if chunk.len() > 2 { chunk[2] } else { 0 },
+        ];
+        out.push(B64_ALPH[(b[0] >> 2) as usize] as char);
+        out.push(B64_ALPH[((b[0] & 0x03) << 4 | b[1] >> 4) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64_ALPH[((b[1] & 0x0f) << 2 | b[2] >> 6) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(B64_ALPH[(b[2] & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, McpError> {
+    let s = s.trim();
+    if s.len() % 4 != 0 {
+        return Err(bad_arg("base64 length must be a multiple of 4"));
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut buf = [0i32; 4];
+        let mut pad = 0usize;
+        for j in 0..4 {
+            let c = bytes[i + j];
+            buf[j] = match c {
+                b'A'..=b'Z' => (c - b'A') as i32,
+                b'a'..=b'z' => (c - b'a' + 26) as i32,
+                b'0'..=b'9' => (c - b'0' + 52) as i32,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    pad += 1;
+                    0
+                }
+                _ => return Err(bad_arg(format!("invalid base64 char: 0x{c:02x}"))),
+            };
+        }
+        let triple = (buf[0] << 18) | (buf[1] << 12) | (buf[2] << 6) | buf[3];
+        out.push(((triple >> 16) & 0xff) as u8);
+        if pad < 2 {
+            out.push(((triple >> 8) & 0xff) as u8);
+        }
+        if pad < 1 {
+            out.push((triple & 0xff) as u8);
+        }
+        i += 4;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +552,23 @@ mod tests {
         let t = parse_ts("2026-05-14T12:00:00Z").unwrap();
         assert_eq!(t.to_rfc3339(), "2026-05-14T12:00:00+00:00");
         assert!(parse_ts("not a date").is_err());
+    }
+
+    #[test]
+    fn b64_encode_decode_round_trips_all_byte_lengths() {
+        for n in 0..=20 {
+            let raw: Vec<u8> = (0..n).map(|i| (i * 7) as u8).collect();
+            let enc = b64_encode(&raw);
+            let dec = b64_decode(&enc).unwrap();
+            assert_eq!(dec, raw, "round-trip failed at len={n}");
+        }
+    }
+
+    #[test]
+    fn b64_decode_matches_known_strings() {
+        // sanity against widely-known fixtures
+        assert_eq!(b64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(b64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
+        assert!(b64_decode("not%base64=").is_err());
     }
 }

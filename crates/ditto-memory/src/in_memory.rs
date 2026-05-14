@@ -18,7 +18,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use ditto_core::{
-    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt,
+    ScopeId, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -39,6 +40,10 @@ struct Inner {
     nodes: HashMap<NodeId, Node>,
     /// edge_id -> edge (versioned via bi-temporal cols on the value)
     edges: HashMap<EdgeId, Edge>,
+    /// (tenant_id, blob_hash) -> blob. Per-tenant CAS — same bytes for two
+    /// tenants are stored twice so deletes can't leak across the isolation
+    /// boundary.
+    blobs: HashMap<(TenantId, BlobHash), Blob>,
 }
 
 impl InMemoryStorage {
@@ -133,6 +138,7 @@ impl Storage for InMemoryStorage {
         }
         inner.nodes.retain(|_, n| n.tenant_id != tenant_id);
         inner.edges.retain(|_, e| e.tenant_id != tenant_id);
+        inner.blobs.retain(|(t, _), _| *t != tenant_id);
         Ok(())
     }
 
@@ -371,6 +377,28 @@ impl Storage for InMemoryStorage {
                 .then(a.src.0.cmp(&b.src.0))
         });
         Ok(out)
+    }
+
+    async fn put_blob(&self, tenant_id: TenantId, blob: &Blob) -> StorageResult<BlobHash> {
+        let hash = blob.hash();
+        let mut inner = self.inner.lock().unwrap();
+        // Idempotent on hash. If the same bytes arrive twice the existing
+        // record wins — second-writer's content_type does not overwrite.
+        inner
+            .blobs
+            .entry((tenant_id, hash))
+            .or_insert_with(|| blob.clone());
+        Ok(hash)
+    }
+
+    async fn get_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<Option<Blob>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.blobs.get(&(tenant_id, hash)).cloned())
+    }
+
+    async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.blobs.contains_key(&(tenant_id, hash)))
     }
 }
 

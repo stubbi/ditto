@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use ditto_core::{
-    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt,
+    ScopeId, TenantId,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -132,4 +133,23 @@ pub trait Storage: Send + Sync {
         dst: NodeId,
         rel: Option<&str>,
     ) -> StorageResult<Vec<Edge>>;
+
+    // --- Blob store (CAS) ---
+
+    /// Idempotently store a blob. Returns the SHA-256 of the blob bytes. A
+    /// second `put_blob` with identical bytes for the same tenant is a no-op
+    /// and returns the same hash.
+    ///
+    /// Tenancy: blob storage is partitioned by `tenant_id` even though the
+    /// hash is intrinsic — the same bytes can be persisted independently by
+    /// two tenants, and a delete by one tenant must not affect the other.
+    async fn put_blob(&self, tenant_id: TenantId, blob: &Blob) -> StorageResult<BlobHash>;
+
+    /// Fetch a blob by its hash. Returns `None` if the tenant has not stored
+    /// this blob (even if another tenant has).
+    async fn get_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<Option<Blob>>;
+
+    /// Cheap existence check. Avoids a payload read when the caller only
+    /// needs to know whether to write.
+    async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool>;
 }

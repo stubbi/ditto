@@ -8,6 +8,7 @@
 //! canonical JSON encoding or the receipt structure breaks every persisted memory.
 //! See [`docs/architecture/memory.md`] in the repo for the v2 commitment.
 
+pub mod blob;
 pub mod canonical;
 pub mod error;
 pub mod graph;
@@ -15,6 +16,7 @@ pub mod id;
 pub mod signing;
 pub mod types;
 
+pub use blob::{Blob, BlobHash};
 pub use error::Error;
 pub use graph::{Edge, EdgeId, NewEdge, NewNode, Node, NodeId, SupersedePolicy};
 pub use id::{EventId, ScopeId, TenantId};

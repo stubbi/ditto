@@ -16,8 +16,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 use ditto_core::{
-    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId, SchemaVersion,
-    Signature, Slot, SupersedePolicy, TenantId,
+    Blob, BlobHash, Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId,
+    SchemaVersion, Signature, Slot, SupersedePolicy, TenantId,
 };
 use ditto_memory::search::{SearchQuery, SearchResult};
 use ditto_memory::storage::{Storage, StorageError, StorageResult};
@@ -242,6 +242,11 @@ impl Storage for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Other(format!("reset episodic: {e}")))?;
+        sqlx::query("DELETE FROM blob WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset blob: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| StorageError::Other(format!("reset commit: {e}")))?;
@@ -549,6 +554,64 @@ impl Storage for PostgresStorage {
         .await
         .map_err(|e| StorageError::Other(format!("edges_to_all_time: {e}")))?;
         rows.into_iter().map(row_to_edge).collect()
+    }
+
+    async fn put_blob(&self, tenant_id: TenantId, blob: &Blob) -> StorageResult<BlobHash> {
+        let hash = blob.hash();
+        let bytelen = i32::try_from(blob.bytes.len())
+            .map_err(|_| StorageError::Other("blob exceeds i32 byte length".into()))?;
+        // Idempotent on PK (tenant_id, content_hash). `ON CONFLICT DO NOTHING`
+        // preserves first-writer's content_type — the second `put_blob` of
+        // the same bytes by the same tenant is a no-op, matching InMemory.
+        sqlx::query(
+            r#"INSERT INTO blob (tenant_id, content_hash, content_type, payload, bytelen)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (tenant_id, content_hash) DO NOTHING"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&hash.0[..])
+        .bind(&blob.content_type)
+        .bind(&blob.bytes)
+        .bind(bytelen)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("put_blob: {e}")))?;
+        Ok(hash)
+    }
+
+    async fn get_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<Option<Blob>> {
+        let row = sqlx::query(
+            r#"SELECT content_type, payload
+               FROM blob
+               WHERE tenant_id = $1 AND content_hash = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&hash.0[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("get_blob: {e}")))?;
+        let Some(row) = row else { return Ok(None) };
+        let content_type: String = row
+            .try_get("content_type")
+            .map_err(|e| StorageError::Other(format!("content_type col: {e}")))?;
+        let payload: Vec<u8> = row
+            .try_get("payload")
+            .map_err(|e| StorageError::Other(format!("payload col: {e}")))?;
+        Ok(Some(Blob::new(payload, content_type)))
+    }
+
+    async fn has_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
+        let row = sqlx::query(
+            r#"SELECT 1 AS one
+               FROM blob
+               WHERE tenant_id = $1 AND content_hash = $2"#,
+        )
+        .bind(tenant_id.0)
+        .bind(&hash.0[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("has_blob: {e}")))?;
+        Ok(row.is_some())
     }
 }
 
