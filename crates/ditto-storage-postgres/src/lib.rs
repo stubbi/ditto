@@ -16,7 +16,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 use ditto_core::{
-    Event, EventId, Receipt, ScopeId, SchemaVersion, Signature, Slot, TenantId,
+    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId, SchemaVersion,
+    Signature, Slot, SupersedePolicy, TenantId,
 };
 use ditto_memory::search::{SearchQuery, SearchResult};
 use ditto_memory::storage::{Storage, StorageError, StorageResult};
@@ -221,6 +222,16 @@ impl Storage for PostgresStorage {
             .begin()
             .await
             .map_err(|e| StorageError::Other(format!("begin: {e}")))?;
+        sqlx::query("DELETE FROM nc_edge WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset nc_edge: {e}")))?;
+        sqlx::query("DELETE FROM nc_node WHERE tenant_id = $1")
+            .bind(tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("reset nc_node: {e}")))?;
         sqlx::query("DELETE FROM receipt WHERE tenant_id = $1")
             .bind(tenant_id.0)
             .execute(&mut *tx)
@@ -234,6 +245,244 @@ impl Storage for PostgresStorage {
         tx.commit()
             .await
             .map_err(|e| StorageError::Other(format!("reset commit: {e}")))?;
+        Ok(())
+    }
+
+    // --- NC-graph ---
+
+    async fn insert_node(&self, node: NewNode) -> StorageResult<Node> {
+        let provenance_bytes: Vec<Vec<u8>> = node.provenance.iter().map(|e| e.0.to_vec()).collect();
+        let now = Utc::now();
+        let row = sqlx::query(
+            r#"
+            INSERT INTO nc_node
+                (node_id, tenant_id, scope_id, node_type, properties, t_created, provenance)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING node_id, tenant_id, scope_id, node_type, properties, t_created, provenance
+            "#,
+        )
+        .bind(node.node_id.0)
+        .bind(node.tenant_id.0)
+        .bind(node.scope_id.0)
+        .bind(&node.node_type)
+        .bind(&node.properties)
+        .bind(now)
+        .bind(&provenance_bytes)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("insert_node: {e}")))?;
+        row_to_node(row)
+    }
+
+    async fn assert_node(&self, node: NewNode) -> StorageResult<Node> {
+        let provenance_bytes: Vec<Vec<u8>> = node.provenance.iter().map(|e| e.0.to_vec()).collect();
+        let now = Utc::now();
+        // ON CONFLICT (node_id) DO NOTHING + RETURNING returns 0 rows on conflict,
+        // so we fall back to a SELECT for the existing row.
+        sqlx::query(
+            r#"
+            INSERT INTO nc_node
+                (node_id, tenant_id, scope_id, node_type, properties, t_created, provenance)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (node_id) DO NOTHING
+            "#,
+        )
+        .bind(node.node_id.0)
+        .bind(node.tenant_id.0)
+        .bind(node.scope_id.0)
+        .bind(&node.node_type)
+        .bind(&node.properties)
+        .bind(now)
+        .bind(&provenance_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("assert_node insert: {e}")))?;
+
+        match self.get_node(node.node_id).await? {
+            Some(n) => Ok(n),
+            None => Err(StorageError::Other("assert_node: node missing after insert".into())),
+        }
+    }
+
+    async fn get_node(&self, node_id: NodeId) -> StorageResult<Option<Node>> {
+        let row = sqlx::query(
+            r#"SELECT node_id, tenant_id, scope_id, node_type, properties, t_created, provenance
+               FROM nc_node WHERE node_id = $1"#,
+        )
+        .bind(node_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("get_node: {e}")))?;
+        Ok(row.map(row_to_node).transpose()?)
+    }
+
+    async fn insert_edge(&self, new_edge: NewEdge) -> StorageResult<Edge> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Other(format!("begin: {e}")))?;
+
+        // Supersession runs in the same transaction so insert + invalidate are atomic.
+        if let Some(policy) = new_edge.supersede {
+            let dst_filter: Option<uuid::Uuid> = match policy {
+                SupersedePolicy::AnyWithSameRelation => None,
+                SupersedePolicy::SameSrcRelDst => Some(new_edge.dst.0),
+            };
+            sqlx::query(
+                r#"
+                UPDATE nc_edge
+                SET t_invalid = $4, t_expired = now()
+                WHERE tenant_id = $1
+                  AND src = $2
+                  AND rel = $3
+                  AND t_expired IS NULL
+                  AND t_invalid IS NULL
+                  AND ($5::uuid IS NULL OR dst = $5)
+                "#,
+            )
+            .bind(new_edge.tenant_id.0)
+            .bind(new_edge.src.0)
+            .bind(&new_edge.rel)
+            .bind(new_edge.t_valid)
+            .bind(dst_filter)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("supersede: {e}")))?;
+        }
+
+        let provenance_bytes: Vec<Vec<u8>> =
+            new_edge.provenance.iter().map(|e| e.0.to_vec()).collect();
+        let row = sqlx::query(
+            r#"
+            INSERT INTO nc_edge
+                (edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                 t_created, t_expired, t_valid, t_invalid, provenance)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), NULL, $8, $9, $10)
+            RETURNING edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+            "#,
+        )
+        .bind(new_edge.edge_id.0)
+        .bind(new_edge.src.0)
+        .bind(new_edge.dst.0)
+        .bind(&new_edge.rel)
+        .bind(new_edge.strength.unwrap_or(0.1))
+        .bind(new_edge.tenant_id.0)
+        .bind(new_edge.scope_id.0)
+        .bind(new_edge.t_valid)
+        .bind(new_edge.t_invalid)
+        .bind(&provenance_bytes)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Other(format!("insert_edge: {e}")))?;
+
+        let edge = row_to_edge(row)?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Other(format!("insert_edge commit: {e}")))?;
+        Ok(edge)
+    }
+
+    async fn get_edge(&self, edge_id: EdgeId) -> StorageResult<Option<Edge>> {
+        let row = sqlx::query(
+            r#"SELECT edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+               FROM nc_edge WHERE edge_id = $1"#,
+        )
+        .bind(edge_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("get_edge: {e}")))?;
+        Ok(row.map(row_to_edge).transpose()?)
+    }
+
+    async fn current_edges_from(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let rows = sqlx::query(
+            r#"SELECT edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+               FROM nc_edge
+               WHERE tenant_id = $1 AND src = $2
+                 AND t_expired IS NULL AND t_invalid IS NULL
+                 AND ($3::text IS NULL OR rel = $3)
+               ORDER BY t_created DESC"#,
+        )
+        .bind(tenant_id.0)
+        .bind(src.0)
+        .bind(rel)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("current_edges_from: {e}")))?;
+        rows.into_iter().map(row_to_edge).collect()
+    }
+
+    async fn current_edges_to(
+        &self,
+        tenant_id: TenantId,
+        dst: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let rows = sqlx::query(
+            r#"SELECT edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+               FROM nc_edge
+               WHERE tenant_id = $1 AND dst = $2
+                 AND t_expired IS NULL AND t_invalid IS NULL
+                 AND ($3::text IS NULL OR rel = $3)
+               ORDER BY t_created DESC"#,
+        )
+        .bind(tenant_id.0)
+        .bind(dst.0)
+        .bind(rel)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("current_edges_to: {e}")))?;
+        rows.into_iter().map(row_to_edge).collect()
+    }
+
+    async fn edges_from_at(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        t: DateTime<Utc>,
+    ) -> StorageResult<Vec<Edge>> {
+        let rows = sqlx::query(
+            r#"SELECT edge_id, src, dst, rel, strength, tenant_id, scope_id,
+                      t_created, t_expired, t_valid, t_invalid, provenance
+               FROM nc_edge
+               WHERE tenant_id = $1 AND src = $2
+                 AND t_valid <= $3
+                 AND (t_invalid IS NULL OR t_invalid > $3)
+               ORDER BY t_valid DESC"#,
+        )
+        .bind(tenant_id.0)
+        .bind(src.0)
+        .bind(t)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("edges_from_at: {e}")))?;
+        rows.into_iter().map(row_to_edge).collect()
+    }
+
+    async fn invalidate_edge(
+        &self,
+        edge_id: EdgeId,
+        t_invalid: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let res = sqlx::query("UPDATE nc_edge SET t_invalid = $2 WHERE edge_id = $1")
+            .bind(edge_id.0)
+            .bind(t_invalid)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Other(format!("invalidate_edge: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(StorageError::Other(format!("edge {edge_id} not found")));
+        }
         Ok(())
     }
 }
@@ -346,4 +595,102 @@ fn row_to_receipt(row: sqlx::postgres::PgRow) -> StorageResult<Receipt> {
 #[allow(dead_code)]
 fn parse_event_id(s: &str) -> StorageResult<EventId> {
     EventId::from_str(s).map_err(|e| StorageError::Other(format!("event_id parse: {e}")))
+}
+
+fn row_to_node(row: sqlx::postgres::PgRow) -> StorageResult<Node> {
+    let node_id: uuid::Uuid = row
+        .try_get("node_id")
+        .map_err(|e| StorageError::Other(format!("node_id col: {e}")))?;
+    let tenant_id: uuid::Uuid = row
+        .try_get("tenant_id")
+        .map_err(|e| StorageError::Other(format!("tenant_id col: {e}")))?;
+    let scope_id: uuid::Uuid = row
+        .try_get("scope_id")
+        .map_err(|e| StorageError::Other(format!("scope_id col: {e}")))?;
+    let node_type: String = row
+        .try_get("node_type")
+        .map_err(|e| StorageError::Other(format!("node_type col: {e}")))?;
+    let properties: Value = row
+        .try_get("properties")
+        .map_err(|e| StorageError::Other(format!("properties col: {e}")))?;
+    let t_created: DateTime<Utc> = row
+        .try_get("t_created")
+        .map_err(|e| StorageError::Other(format!("t_created col: {e}")))?;
+    let provenance_bytes: Vec<Vec<u8>> = row
+        .try_get("provenance")
+        .map_err(|e| StorageError::Other(format!("provenance col: {e}")))?;
+    let provenance = provenance_bytes
+        .into_iter()
+        .map(|b| EventId::from_hex(&hex_lower(&b)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StorageError::Other(format!("provenance decode: {e}")))?;
+
+    Ok(Node {
+        node_id: NodeId(node_id),
+        tenant_id: TenantId(tenant_id),
+        scope_id: ScopeId(scope_id),
+        node_type,
+        properties,
+        t_created,
+        provenance,
+    })
+}
+
+fn row_to_edge(row: sqlx::postgres::PgRow) -> StorageResult<Edge> {
+    let edge_id: uuid::Uuid = row
+        .try_get("edge_id")
+        .map_err(|e| StorageError::Other(format!("edge_id col: {e}")))?;
+    let src: uuid::Uuid = row
+        .try_get("src")
+        .map_err(|e| StorageError::Other(format!("src col: {e}")))?;
+    let dst: uuid::Uuid = row
+        .try_get("dst")
+        .map_err(|e| StorageError::Other(format!("dst col: {e}")))?;
+    let rel: String = row
+        .try_get("rel")
+        .map_err(|e| StorageError::Other(format!("rel col: {e}")))?;
+    let strength: f32 = row
+        .try_get("strength")
+        .map_err(|e| StorageError::Other(format!("strength col: {e}")))?;
+    let tenant_id: uuid::Uuid = row
+        .try_get("tenant_id")
+        .map_err(|e| StorageError::Other(format!("tenant_id col: {e}")))?;
+    let scope_id: uuid::Uuid = row
+        .try_get("scope_id")
+        .map_err(|e| StorageError::Other(format!("scope_id col: {e}")))?;
+    let t_created: DateTime<Utc> = row
+        .try_get("t_created")
+        .map_err(|e| StorageError::Other(format!("t_created col: {e}")))?;
+    let t_expired: Option<DateTime<Utc>> = row
+        .try_get("t_expired")
+        .map_err(|e| StorageError::Other(format!("t_expired col: {e}")))?;
+    let t_valid: DateTime<Utc> = row
+        .try_get("t_valid")
+        .map_err(|e| StorageError::Other(format!("t_valid col: {e}")))?;
+    let t_invalid: Option<DateTime<Utc>> = row
+        .try_get("t_invalid")
+        .map_err(|e| StorageError::Other(format!("t_invalid col: {e}")))?;
+    let provenance_bytes: Vec<Vec<u8>> = row
+        .try_get("provenance")
+        .map_err(|e| StorageError::Other(format!("provenance col: {e}")))?;
+    let provenance = provenance_bytes
+        .into_iter()
+        .map(|b| EventId::from_hex(&hex_lower(&b)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StorageError::Other(format!("provenance decode: {e}")))?;
+
+    Ok(Edge {
+        edge_id: EdgeId(edge_id),
+        src: NodeId(src),
+        dst: NodeId(dst),
+        rel,
+        strength,
+        tenant_id: TenantId(tenant_id),
+        scope_id: ScopeId(scope_id),
+        t_created,
+        t_expired,
+        t_valid,
+        t_invalid,
+        provenance,
+    })
 }

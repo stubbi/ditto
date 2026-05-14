@@ -21,8 +21,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ditto_core::{
-    Event, EventId, InstallKey, Receipt, ScopeId, SchemaVersion, Slot, TenantId,
-    CURRENT_SCHEMA_VERSION,
+    Edge, EdgeId, Event, EventId, InstallKey, NewEdge, NewNode, Node, NodeId, Receipt, ScopeId,
+    SchemaVersion, Slot, TenantId, CURRENT_SCHEMA_VERSION,
 };
 
 use crate::search::{SearchQuery, SearchResult};
@@ -123,16 +123,85 @@ impl<S: Storage> MemoryController<S> {
         heads.retain(|(t, _), _| *t != tenant_id);
         Ok(())
     }
+
+    // --- NC-graph surface ---
+
+    /// Idempotent node upsert by `node_id`.
+    pub async fn assert_node(&self, node: NewNode) -> StorageResult<Node> {
+        self.storage.assert_node(node).await
+    }
+
+    pub async fn get_node(&self, node_id: NodeId) -> StorageResult<Option<Node>> {
+        self.storage.get_node(node_id).await
+    }
+
+    /// Write a semantic fact (NC-graph edge) with optional supersession of
+    /// prior contradicting facts. Atomic with the supersession update.
+    pub async fn write_fact(&self, fact: NewEdge) -> StorageResult<Edge> {
+        self.storage.insert_edge(fact).await
+    }
+
+    pub async fn get_edge(&self, edge_id: EdgeId) -> StorageResult<Option<Edge>> {
+        self.storage.get_edge(edge_id).await
+    }
+
+    pub async fn current_edges_from(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        self.storage.current_edges_from(tenant_id, src, rel).await
+    }
+
+    pub async fn current_edges_to(
+        &self,
+        tenant_id: TenantId,
+        dst: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        self.storage.current_edges_to(tenant_id, dst, rel).await
+    }
+
+    /// Time-travel query: outgoing edges from `src` that were valid at `t`.
+    pub async fn edges_from_at(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        t: DateTime<Utc>,
+    ) -> StorageResult<Vec<Edge>> {
+        self.storage.edges_from_at(tenant_id, src, t).await
+    }
+
+    /// Mark an edge as no-longer-true at `t_invalid`. The edge stays
+    /// queryable for historical reads.
+    pub async fn invalidate_edge(
+        &self,
+        edge_id: EdgeId,
+        t_invalid: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        self.storage.invalidate_edge(edge_id, t_invalid).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::in_memory::InMemoryStorage;
+    use chrono::TimeZone;
+    use ditto_core::SupersedePolicy;
     use serde_json::json;
 
     fn now() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    fn ctrl() -> MemoryController<InMemoryStorage> {
+        MemoryController::new(InMemoryStorage::new(), InstallKey::generate())
+    }
+
+    fn t(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).unwrap()
     }
 
     #[tokio::test]
@@ -265,6 +334,298 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.prev_event_id, None);
+    }
+
+    // --- NC-graph tests ---
+
+    fn alice_node(tenant: TenantId, scope: ScopeId) -> NewNode {
+        NewNode {
+            node_id: NodeId::new(),
+            tenant_id: tenant,
+            scope_id: scope,
+            node_type: "Person".into(),
+            properties: json!({"name": "Alice"}),
+            provenance: vec![],
+        }
+    }
+
+    fn place_node(tenant: TenantId, scope: ScopeId, name: &str) -> NewNode {
+        NewNode {
+            node_id: NodeId::new(),
+            tenant_id: tenant,
+            scope_id: scope,
+            node_type: "Place".into(),
+            properties: json!({"name": name}),
+            provenance: vec![],
+        }
+    }
+
+    fn lives_in(
+        tenant: TenantId,
+        scope: ScopeId,
+        src: NodeId,
+        dst: NodeId,
+        valid_from: DateTime<Utc>,
+        supersede: Option<SupersedePolicy>,
+    ) -> NewEdge {
+        NewEdge {
+            edge_id: EdgeId::new(),
+            src,
+            dst,
+            rel: "lives_in".into(),
+            strength: None,
+            tenant_id: tenant,
+            scope_id: scope,
+            t_valid: valid_from,
+            t_invalid: None,
+            provenance: vec![],
+            supersede,
+        }
+    }
+
+    #[tokio::test]
+    async fn assert_node_is_idempotent_on_node_id() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let mut spec = alice_node(tenant, scope);
+        let id = spec.node_id;
+        let n1 = ctrl.assert_node(spec.clone()).await.unwrap();
+        // Second call with different properties returns the original (no overwrite).
+        spec.properties = json!({"name": "Alice", "age": 30});
+        let n2 = ctrl.assert_node(spec).await.unwrap();
+        assert_eq!(n1.node_id, id);
+        assert_eq!(n2.node_id, id);
+        assert_eq!(n2.properties, json!({"name": "Alice"}));
+    }
+
+    #[tokio::test]
+    async fn write_fact_persists_edge_with_provenance() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let alice = ctrl.assert_node(alice_node(tenant, scope)).await.unwrap();
+        let berlin = ctrl
+            .assert_node(place_node(tenant, scope, "Berlin"))
+            .await
+            .unwrap();
+        let fact = lives_in(tenant, scope, alice.node_id, berlin.node_id, now(), None);
+        let edge_id = fact.edge_id;
+        let edge = ctrl.write_fact(fact).await.unwrap();
+        assert_eq!(edge.edge_id, edge_id);
+        assert!(edge.is_current());
+        let fetched = ctrl.get_edge(edge_id).await.unwrap().unwrap();
+        assert_eq!(fetched.src, alice.node_id);
+        assert_eq!(fetched.dst, berlin.node_id);
+        assert_eq!(fetched.rel, "lives_in");
+    }
+
+    #[tokio::test]
+    async fn supersede_any_with_same_relation_invalidates_prior() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let alice = ctrl.assert_node(alice_node(tenant, scope)).await.unwrap();
+        let nyc = ctrl
+            .assert_node(place_node(tenant, scope, "NYC"))
+            .await
+            .unwrap();
+        let sf = ctrl
+            .assert_node(place_node(tenant, scope, "SF"))
+            .await
+            .unwrap();
+
+        let t_old = t(2020, 1, 1);
+        let t_new = t(2026, 5, 1);
+
+        let old_edge = ctrl
+            .write_fact(lives_in(tenant, scope, alice.node_id, nyc.node_id, t_old, None))
+            .await
+            .unwrap();
+        let new_edge = ctrl
+            .write_fact(lives_in(
+                tenant,
+                scope,
+                alice.node_id,
+                sf.node_id,
+                t_new,
+                Some(SupersedePolicy::AnyWithSameRelation),
+            ))
+            .await
+            .unwrap();
+
+        // Old edge: t_invalid = new edge's t_valid; t_expired set; no longer current.
+        let old_fetched = ctrl.get_edge(old_edge.edge_id).await.unwrap().unwrap();
+        assert_eq!(old_fetched.t_invalid, Some(t_new));
+        assert!(old_fetched.t_expired.is_some());
+        assert!(!old_fetched.is_current());
+
+        // New edge is current.
+        assert!(new_edge.is_current());
+
+        // current_edges_from returns only the new edge.
+        let current = ctrl
+            .current_edges_from(tenant, alice.node_id, Some("lives_in"))
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].edge_id, new_edge.edge_id);
+    }
+
+    #[tokio::test]
+    async fn supersede_same_src_rel_dst_only_invalidates_matching_dst() {
+        // If Alice "interested_in" two topics, asserting a new "interested_in"
+        // for one topic should not invalidate the other.
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let alice = ctrl.assert_node(alice_node(tenant, scope)).await.unwrap();
+        let topic_a = ctrl
+            .assert_node(place_node(tenant, scope, "topic-A"))
+            .await
+            .unwrap();
+        let topic_b = ctrl
+            .assert_node(place_node(tenant, scope, "topic-B"))
+            .await
+            .unwrap();
+
+        let make = |dst: NodeId, supersede: Option<SupersedePolicy>| NewEdge {
+            edge_id: EdgeId::new(),
+            src: alice.node_id,
+            dst,
+            rel: "interested_in".into(),
+            strength: None,
+            tenant_id: tenant,
+            scope_id: scope,
+            t_valid: now(),
+            t_invalid: None,
+            provenance: vec![],
+            supersede,
+        };
+
+        let e_a = ctrl.write_fact(make(topic_a.node_id, None)).await.unwrap();
+        let e_b = ctrl.write_fact(make(topic_b.node_id, None)).await.unwrap();
+        // Re-assert A with SameSrcRelDst policy — only A should be invalidated.
+        let _ = ctrl
+            .write_fact(make(topic_a.node_id, Some(SupersedePolicy::SameSrcRelDst)))
+            .await
+            .unwrap();
+
+        let a_fetched = ctrl.get_edge(e_a.edge_id).await.unwrap().unwrap();
+        let b_fetched = ctrl.get_edge(e_b.edge_id).await.unwrap().unwrap();
+        assert!(!a_fetched.is_current());
+        assert!(b_fetched.is_current());
+    }
+
+    #[tokio::test]
+    async fn time_travel_returns_valid_at_t() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let alice = ctrl.assert_node(alice_node(tenant, scope)).await.unwrap();
+        let nyc = ctrl
+            .assert_node(place_node(tenant, scope, "NYC"))
+            .await
+            .unwrap();
+        let sf = ctrl
+            .assert_node(place_node(tenant, scope, "SF"))
+            .await
+            .unwrap();
+
+        // Alice lived in NYC from 2018 to 2026-05-01, then in SF.
+        let t_nyc_start = t(2018, 1, 1);
+        let t_move = t(2026, 5, 1);
+
+        let _ = ctrl
+            .write_fact(lives_in(
+                tenant,
+                scope,
+                alice.node_id,
+                nyc.node_id,
+                t_nyc_start,
+                None,
+            ))
+            .await
+            .unwrap();
+        let _ = ctrl
+            .write_fact(lives_in(
+                tenant,
+                scope,
+                alice.node_id,
+                sf.node_id,
+                t_move,
+                Some(SupersedePolicy::AnyWithSameRelation),
+            ))
+            .await
+            .unwrap();
+
+        // As of 2020, Alice lives in NYC.
+        let at_2020 = ctrl
+            .edges_from_at(tenant, alice.node_id, t(2020, 6, 1))
+            .await
+            .unwrap();
+        assert_eq!(at_2020.len(), 1);
+        assert_eq!(at_2020[0].dst, nyc.node_id);
+
+        // As of today (2026-05-14), Alice lives in SF.
+        let at_now = ctrl
+            .edges_from_at(tenant, alice.node_id, t(2026, 5, 14))
+            .await
+            .unwrap();
+        assert_eq!(at_now.len(), 1);
+        assert_eq!(at_now[0].dst, sf.node_id);
+
+        // Exactly at the move (2026-05-01), the new fact takes over.
+        let at_move = ctrl
+            .edges_from_at(tenant, alice.node_id, t_move)
+            .await
+            .unwrap();
+        assert_eq!(at_move.len(), 1);
+        assert_eq!(at_move[0].dst, sf.node_id);
+    }
+
+    #[tokio::test]
+    async fn invalidate_edge_sets_t_invalid() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let alice = ctrl.assert_node(alice_node(tenant, scope)).await.unwrap();
+        let berlin = ctrl
+            .assert_node(place_node(tenant, scope, "Berlin"))
+            .await
+            .unwrap();
+        let edge = ctrl
+            .write_fact(lives_in(tenant, scope, alice.node_id, berlin.node_id, now(), None))
+            .await
+            .unwrap();
+
+        let cutoff = t(2027, 1, 1);
+        ctrl.invalidate_edge(edge.edge_id, cutoff).await.unwrap();
+        let fetched = ctrl.get_edge(edge.edge_id).await.unwrap().unwrap();
+        assert_eq!(fetched.t_invalid, Some(cutoff));
+    }
+
+    #[tokio::test]
+    async fn reset_clears_graph_state() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let alice = ctrl.assert_node(alice_node(tenant, scope)).await.unwrap();
+        let berlin = ctrl
+            .assert_node(place_node(tenant, scope, "Berlin"))
+            .await
+            .unwrap();
+        let _ = ctrl
+            .write_fact(lives_in(tenant, scope, alice.node_id, berlin.node_id, now(), None))
+            .await
+            .unwrap();
+        ctrl.reset(tenant).await.unwrap();
+        assert!(ctrl.get_node(alice.node_id).await.unwrap().is_none());
+        assert!(ctrl
+            .current_edges_from(tenant, alice.node_id, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

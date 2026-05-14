@@ -14,12 +14,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use ditto_core::{Event, EventId, Receipt, TenantId};
+use ditto_core::{
+    Edge, EdgeId, Event, EventId, NewEdge, NewNode, Node, NodeId, Receipt, TenantId,
+};
 
 use crate::search::{SearchQuery, SearchResult};
-use crate::storage::{Storage, StorageResult};
+use crate::storage::{Storage, StorageError, StorageResult};
 
 #[derive(Default)]
 pub struct InMemoryStorage {
@@ -32,6 +35,10 @@ struct Inner {
     events: HashMap<TenantId, Vec<Event>>,
     /// event_id -> receipt
     receipts: HashMap<EventId, Receipt>,
+    /// node_id -> node (nodes are immutable in v0)
+    nodes: HashMap<NodeId, Node>,
+    /// edge_id -> edge (versioned via bi-temporal cols on the value)
+    edges: HashMap<EdgeId, Edge>,
 }
 
 impl InMemoryStorage {
@@ -124,7 +131,180 @@ impl Storage for InMemoryStorage {
                 inner.receipts.remove(&e.event_id);
             }
         }
+        inner.nodes.retain(|_, n| n.tenant_id != tenant_id);
+        inner.edges.retain(|_, e| e.tenant_id != tenant_id);
         Ok(())
+    }
+
+    async fn insert_node(&self, node: NewNode) -> StorageResult<Node> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nodes.contains_key(&node.node_id) {
+            return Err(StorageError::Other(format!(
+                "node {} already exists",
+                node.node_id
+            )));
+        }
+        let n = Node {
+            node_id: node.node_id,
+            tenant_id: node.tenant_id,
+            scope_id: node.scope_id,
+            node_type: node.node_type,
+            properties: node.properties,
+            t_created: Utc::now(),
+            provenance: node.provenance,
+        };
+        inner.nodes.insert(n.node_id, n.clone());
+        Ok(n)
+    }
+
+    async fn assert_node(&self, node: NewNode) -> StorageResult<Node> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.nodes.get(&node.node_id) {
+            return Ok(existing.clone());
+        }
+        let n = Node {
+            node_id: node.node_id,
+            tenant_id: node.tenant_id,
+            scope_id: node.scope_id,
+            node_type: node.node_type,
+            properties: node.properties,
+            t_created: Utc::now(),
+            provenance: node.provenance,
+        };
+        inner.nodes.insert(n.node_id, n.clone());
+        Ok(n)
+    }
+
+    async fn get_node(&self, node_id: NodeId) -> StorageResult<Option<Node>> {
+        Ok(self.inner.lock().unwrap().nodes.get(&node_id).cloned())
+    }
+
+    async fn insert_edge(&self, new_edge: NewEdge) -> StorageResult<Edge> {
+        use ditto_core::SupersedePolicy;
+        let mut inner = self.inner.lock().unwrap();
+        let now = Utc::now();
+
+        // Supersession runs first: find matching current edges, set t_invalid
+        // to the new edge's t_valid and t_expired to now. All in one critical
+        // section so it is atomic against concurrent inserts.
+        if let Some(policy) = new_edge.supersede {
+            for edge in inner.edges.values_mut() {
+                if edge.tenant_id != new_edge.tenant_id
+                    || edge.src != new_edge.src
+                    || edge.rel != new_edge.rel
+                    || !edge.is_current()
+                {
+                    continue;
+                }
+                let matches = match policy {
+                    SupersedePolicy::AnyWithSameRelation => true,
+                    SupersedePolicy::SameSrcRelDst => edge.dst == new_edge.dst,
+                };
+                if matches {
+                    edge.t_invalid = Some(new_edge.t_valid);
+                    edge.t_expired = Some(now);
+                }
+            }
+        }
+
+        let edge = Edge {
+            edge_id: new_edge.edge_id,
+            src: new_edge.src,
+            dst: new_edge.dst,
+            rel: new_edge.rel,
+            strength: new_edge.strength.unwrap_or(0.1),
+            tenant_id: new_edge.tenant_id,
+            scope_id: new_edge.scope_id,
+            t_created: now,
+            t_expired: None,
+            t_valid: new_edge.t_valid,
+            t_invalid: new_edge.t_invalid,
+            provenance: new_edge.provenance,
+        };
+        if inner.edges.contains_key(&edge.edge_id) {
+            return Err(StorageError::Other(format!(
+                "edge {} already exists",
+                edge.edge_id
+            )));
+        }
+        inner.edges.insert(edge.edge_id, edge.clone());
+        Ok(edge)
+    }
+
+    async fn get_edge(&self, edge_id: EdgeId) -> StorageResult<Option<Edge>> {
+        Ok(self.inner.lock().unwrap().edges.get(&edge_id).cloned())
+    }
+
+    async fn current_edges_from(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .edges
+            .values()
+            .filter(|e| {
+                e.tenant_id == tenant_id
+                    && e.src == src
+                    && e.is_current()
+                    && rel.is_none_or(|r| e.rel == r)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn current_edges_to(
+        &self,
+        tenant_id: TenantId,
+        dst: NodeId,
+        rel: Option<&str>,
+    ) -> StorageResult<Vec<Edge>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .edges
+            .values()
+            .filter(|e| {
+                e.tenant_id == tenant_id
+                    && e.dst == dst
+                    && e.is_current()
+                    && rel.is_none_or(|r| e.rel == r)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn edges_from_at(
+        &self,
+        tenant_id: TenantId,
+        src: NodeId,
+        t: DateTime<Utc>,
+    ) -> StorageResult<Vec<Edge>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .edges
+            .values()
+            .filter(|e| e.tenant_id == tenant_id && e.src == src && e.is_valid_at(t))
+            .cloned()
+            .collect())
+    }
+
+    async fn invalidate_edge(
+        &self,
+        edge_id: EdgeId,
+        t_invalid: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.edges.get_mut(&edge_id) {
+            Some(e) => {
+                e.t_invalid = Some(t_invalid);
+                Ok(())
+            }
+            None => Err(StorageError::Other(format!(
+                "edge {edge_id} not found"
+            ))),
+        }
     }
 }
 

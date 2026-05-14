@@ -16,7 +16,7 @@ eval/
   ditto-eval Python package — see eval/README.md
 ```
 
-25 tests green (canonical JSON determinism, content addressing, Ed25519 sign/verify, hash chain, signed receipts, idempotent writes, in-memory search). Cross-language interop check: `EventId` computed in Rust matches `content_address` in the Python eval harness for the same payload bit-for-bit.
+32 tests green (canonical JSON determinism, content addressing, Ed25519 sign/verify, hash chain, signed receipts, idempotent writes, in-memory search, bi-temporal edge supersession, time-travel queries, retroactive invalidation). Cross-language interop check: `EventId` computed in Rust matches `content_address` in the Python eval harness for the same payload bit-for-bit.
 
 ```bash
 cargo build && cargo test                 # 25/25 pass

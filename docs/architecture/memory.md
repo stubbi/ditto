@@ -134,6 +134,8 @@ Source-scoped retrieval is first-class: `memory.search(scope=["matter:acme-v-glo
 
 Tables (initial schema):
 
+**v0 implementation note:** the schema below describes the target shape. v0 ships `nc_node` as immutable (no bi-temporal columns on nodes) — nodes are stable concept handles; all bi-temporal semantics live on edges. Node-versioning can be added later via an additive migration (split into `row_id` PK + `node_id` logical identity) without breaking edge queries.
+
 ```sql
 -- Episodic: sparse index, pointers only
 CREATE TABLE episodic (
@@ -150,18 +152,15 @@ CREATE TABLE episodic (
     signature       bytea NOT NULL,               -- SCITT receipt sig
     schema_version  int NOT NULL
 );
--- Bi-temporal semantic facts
+-- NC-graph nodes — immutable in v0 (no bi-temporal cols)
 CREATE TABLE nc_node (
     node_id         uuid PRIMARY KEY,
     tenant_id       uuid NOT NULL,
     scope_id        uuid NOT NULL,
-    type            text NOT NULL,
-    properties      jsonb NOT NULL,
-    t_created       timestamptz NOT NULL,
-    t_expired       timestamptz,
-    t_valid         timestamptz NOT NULL,
-    t_invalid       timestamptz,
-    provenance      bytea[] NOT NULL              -- episodic event_ids
+    node_type       text NOT NULL,
+    properties      jsonb NOT NULL DEFAULT '{}',
+    t_created       timestamptz NOT NULL DEFAULT now(),
+    provenance      bytea[] NOT NULL DEFAULT ARRAY[]::bytea[]
 );
 CREATE TABLE nc_edge (
     edge_id         uuid PRIMARY KEY,
