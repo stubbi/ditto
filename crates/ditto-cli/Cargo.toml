@@ -11,6 +11,10 @@ description = "CLI for Ditto. v0: smoke commands against an in-memory or Postgre
 name = "ditto"
 path = "src/main.rs"
 
+[features]
+default = ["openai-embedder"]
+openai-embedder = ["ditto-memory/embedders-http"]
+
 [dependencies]
 ditto-core = { workspace = true }
 ditto-mcp = { workspace = true }

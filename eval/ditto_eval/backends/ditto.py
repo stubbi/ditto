@@ -71,8 +71,16 @@ class DittoBackend(MemoryBackend):
 
     name = "ditto"
 
-    def __init__(self, binary: Path | None = None) -> None:
+    def __init__(self, binary: Path | None = None, embedder: str | None = None) -> None:
         self._binary = binary or _default_binary()
+        # Embedder selection passed to `ditto serve --embedder ...`. Resolution
+        # order: explicit arg → DITTO_EMBEDDER env → "openai" if OPENAI_API_KEY
+        # is set (the eval harness's intended path) → "none".
+        if embedder is None:
+            embedder = os.environ.get("DITTO_EMBEDDER")
+        if embedder is None:
+            embedder = "openai" if os.environ.get("OPENAI_API_KEY") else "none"
+        self._embedder = embedder
         self._stack: Any = None
         self._session: ClientSession | None = None
         # Per-backend scope; the eval harness doesn't supply one. Stable so
@@ -88,7 +96,7 @@ class DittoBackend(MemoryBackend):
         self._stack = AsyncExitStack()
         params = StdioServerParameters(
             command=str(self._binary),
-            args=["serve"],
+            args=["serve", "--embedder", self._embedder],
             env={**os.environ},
         )
         read, write = await self._stack.enter_async_context(stdio_client(params))

@@ -117,6 +117,124 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[cfg(feature = "embedders-http")]
+pub mod openai {
+    //! OpenAI text-embedding adapter.
+    //!
+    //! Targets `text-embedding-3-small` at the default 1536 dimensions —
+    //! matches `EMBEDDING_DIM` and the pgvector column width without
+    //! projection. Switch to `text-embedding-3-large` (3072 dims) by also
+    //! migrating the schema; we keep it minimal in v0.
+    //!
+    //! Auth: reads `OPENAI_API_KEY` from env via `from_env()`. The key is
+    //! held in-memory only; no on-disk persistence here — that's the
+    //! `ditto-models` SubscriptionBackend's job for the long-lived ones.
+
+    use super::{Embedder, EmbedderError, EMBEDDING_DIM};
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+
+    pub const DEFAULT_MODEL: &str = "text-embedding-3-small";
+    pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+    pub struct OpenAiEmbedder {
+        api_key: String,
+        model: String,
+        base_url: String,
+        http: reqwest::Client,
+    }
+
+    impl OpenAiEmbedder {
+        pub fn new(api_key: impl Into<String>) -> Self {
+            Self {
+                api_key: api_key.into(),
+                model: DEFAULT_MODEL.into(),
+                base_url: DEFAULT_BASE_URL.into(),
+                http: reqwest::Client::new(),
+            }
+        }
+
+        pub fn from_env() -> Result<Self, EmbedderError> {
+            let key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                EmbedderError::Other("OPENAI_API_KEY not set".into())
+            })?;
+            Ok(Self::new(key))
+        }
+
+        pub fn with_model(mut self, model: impl Into<String>) -> Self {
+            self.model = model.into();
+            self
+        }
+
+        pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+            self.base_url = url.into();
+            self
+        }
+    }
+
+    #[derive(Serialize)]
+    struct EmbedRequest<'a> {
+        model: &'a str,
+        input: &'a [String],
+    }
+
+    #[derive(Deserialize)]
+    struct EmbedResponse {
+        data: Vec<EmbedItem>,
+    }
+
+    #[derive(Deserialize)]
+    struct EmbedItem {
+        embedding: Vec<f32>,
+        #[serde(default)]
+        index: usize,
+    }
+
+    #[async_trait]
+    impl Embedder for OpenAiEmbedder {
+        fn dim(&self) -> usize {
+            // text-embedding-3-small native dim is 1536.
+            EMBEDDING_DIM
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let req = EmbedRequest {
+                model: &self.model,
+                input: texts,
+            };
+            let resp = self
+                .http
+                .post(format!("{}/embeddings", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| EmbedderError::Other(format!("openai send: {e}")))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(EmbedderError::Other(format!(
+                    "openai http {status}: {body}"
+                )));
+            }
+            let body: EmbedResponse = resp
+                .json()
+                .await
+                .map_err(|e| EmbedderError::Other(format!("openai parse: {e}")))?;
+
+            // OpenAI returns items keyed by `index`; sort defensively so the
+            // output order matches the input order even if the server
+            // reordered (it usually doesn't, but the contract doesn't promise).
+            let mut indexed: Vec<EmbedItem> = body.data;
+            indexed.sort_by_key(|i| i.index);
+            Ok(indexed.into_iter().map(|i| i.embedding).collect())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

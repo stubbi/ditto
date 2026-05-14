@@ -21,6 +21,9 @@ use clap::{Parser, Subcommand};
 
 use ditto_core::{InstallKey, ScopeId, Slot, TenantId};
 use ditto_mcp::serve_stdio;
+use ditto_memory::embedder::{DeterministicEmbedder, Embedder};
+#[cfg(feature = "openai-embedder")]
+use ditto_memory::embedder::openai::OpenAiEmbedder;
 use ditto_memory::{InMemoryStorage, MemoryController, SearchMode, SearchQuery, Storage};
 use ditto_render::{LocalFilesystem, RenderJob};
 use ditto_storage_postgres::PostgresStorage;
@@ -86,7 +89,13 @@ enum Cmd {
     },
     /// Run an MCP server on stdio. Speaks the Model Context Protocol so
     /// Claude Code / Cursor / Zed / Codex Desktop can use Ditto's memory.
-    Serve,
+    Serve {
+        /// Embedder for hybrid retrieval. `none` (default) → BM25 only;
+        /// `deterministic` → in-process hash-projection (tests + CI);
+        /// `openai` → OpenAI text-embedding-3-small (reads OPENAI_API_KEY).
+        #[arg(long, default_value = "none")]
+        embedder: String,
+    },
 }
 
 #[tokio::main]
@@ -198,14 +207,43 @@ async fn run_cmd<S: Storage + 'static>(
             );
             Ok(())
         }
-        Cmd::Serve => {
+        Cmd::Serve { embedder } => {
             // Hand control to the MCP server. Logs go to stderr (configured
             // earlier); stdio is reserved for the JSON-RPC framing.
             let _ = storage; // referenced via ctrl
+            let ctrl = build_embedder(ctrl, &embedder)?;
             serve_stdio(Arc::new(ctrl)).await?;
             Ok(())
         }
     }
+}
+
+fn build_embedder<S: Storage + 'static>(
+    ctrl: MemoryController<S>,
+    selection: &str,
+) -> Result<MemoryController<S>> {
+    let embedder: Option<Arc<dyn Embedder>> = match selection {
+        "none" => None,
+        "deterministic" => Some(Arc::new(DeterministicEmbedder::new())),
+        "openai" => {
+            #[cfg(feature = "openai-embedder")]
+            {
+                let e = OpenAiEmbedder::from_env().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(Arc::new(e))
+            }
+            #[cfg(not(feature = "openai-embedder"))]
+            {
+                anyhow::bail!(
+                    "openai embedder not compiled in (rebuild with --features openai-embedder)"
+                );
+            }
+        }
+        other => anyhow::bail!("unknown embedder selection: {other}"),
+    };
+    Ok(match embedder {
+        Some(e) => ctrl.with_embedder(e),
+        None => ctrl,
+    })
 }
 
 fn parse_slot(s: &str) -> Result<Slot> {

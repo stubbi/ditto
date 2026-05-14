@@ -7,12 +7,19 @@ license.workspace = true
 repository.workspace = true
 description = "MemoryController + Storage trait for Ditto. Pluggable backends behind a single-writer commit path."
 
+[features]
+default = []
+# HTTP embedder adapters (OpenAI etc.). Pulls in reqwest. Disable for embedded
+# / no-net builds.
+embedders-http = ["reqwest"]
+
 [dependencies]
 ditto-core = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

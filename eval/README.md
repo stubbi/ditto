@@ -19,10 +19,12 @@ v0.0.1. Implemented:
 
 ```
 ditto-provenance-bench on stub:    0/3  score 0.000   (substring control floor)
-ditto-provenance-bench on ditto:   0/3  score 0.000   (BM25/tsvector only; semantic retrieval pending)
+ditto-provenance-bench on ditto:   1/3  score 0.333   (RRF over BM25 + DeterministicEmbedder)
 ```
 
-Diagnostic: the integration path (Python harness → MCP → `ditto serve` → in-memory backend) works end-to-end. Ditto and the stub score identically because v0 retrieval is lexical, and the v0 fixtures are deliberately semantic-recall hard ("When was the user born?" vs an event saying "birthday is March 14"). Closing the gap requires vector retrieval + late-interaction rerank — the next memory work.
+Trajectory: BM25-only (0/3) → BM25 + RRF + hash-projection embedder (1/3). Recall is now 1.0 on every case; the remaining two fails are **leak** issues (the retriever surfaces the right record AND a distractor), not retrieval gaps. Closing the leak gap needs late-interaction rerank (ColBERTv2 / MUVERA) on the top-50 — deferred per the v0 scope.
+
+With `OPENAI_API_KEY` set, the harness wires `OpenAiEmbedder` instead of the deterministic one; expect Provenance-Bench to climb further as real semantic similarity replaces hash projection. Run with `DITTO_EMBEDDER=openai` (auto-selected when the key is in env) — see `crates/ditto-memory/src/embedder.rs::openai`.
 
 Checked-in results under `results/` so the trajectory per backend per date is auditable. We deliberately do **not** publish Mem0/Zep/Mastra comparisons on `LongMemEval` / `BEAM` yet — Ditto's retrieval stack is incomplete, and the post-MemPalace-#214 methodology bar requires matched-conditions BM25 baselines at full corpus scale before any public comparison.
 
