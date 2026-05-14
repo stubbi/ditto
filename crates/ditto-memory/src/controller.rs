@@ -839,6 +839,18 @@ impl<S: Storage> MemoryController<S> {
                 .current_edges_from(query.tenant_id, node.node_id, None)
                 .await?;
             for edge in edges {
+                // Relation-relevance filter. The KG-leg historically
+                // surfaced EVERY edge from a node whose name appeared
+                // in the query — i.e., for "What did Caroline research?"
+                // it returned every fact about Caroline, drowning the
+                // research-relevant facts in friend / family / unrelated
+                // edges. Restrict to edges whose relation name has
+                // substring overlap with at least one query token. This
+                // is the v0 of relation-aware KG retrieval; an LLM
+                // relation classifier is the follow-up.
+                if !rel_matches_query(&edge.rel, &q_tokens) {
+                    continue;
+                }
                 // Surface the edge's most recent provenance event as the
                 // canonical "source" for bench-scoring purposes.
                 let Some(&prov) = edge.provenance.last() else {
@@ -1295,14 +1307,13 @@ impl<S: Storage> MemoryController<S> {
 
         let notes = if cue_count == 0 {
             format!(
-                "Rule-extractor sweep: applied facts from {fit} of {} events. \
-                 LLM-driven Observer/Reflector + Graphiti contradiction check \
-                 + ADM counterfactuals still deferred.",
+                "Dream extraction sweep: applied facts from {fit} of {} events. \
+                 Graphiti contradiction check + ADM counterfactuals still deferred.",
                 events.len()
             )
         } else {
             format!(
-                "Rule-extractor sweep (TMR-biased): applied facts from {fit} of {} events; \
+                "Dream extraction sweep (TMR-biased): applied facts from {fit} of {} events; \
                  prioritized by {cue_count} pending cue(s).",
                 events.len()
             )
@@ -1829,6 +1840,38 @@ fn tokenize(s: &str) -> std::collections::HashSet<String> {
         .filter(|t| !t.is_empty() && t.len() > 1)
         .map(String::from)
         .collect()
+}
+
+/// Cheap relation-vs-query matcher for `run_kg_leg`. An edge with
+/// relation `rel` is considered relevant to the query if any token of
+/// the relation has substring overlap (in either direction) with any
+/// token in the query. So `researched` matches `research`, `lived_in`
+/// matches `lives`, `works_at` matches `work`. Stemming-lite, no
+/// dictionary required. The trade-off: also matches some false
+/// positives (e.g., `studied` doesn't match `study` because both are
+/// shortened differently) but we'd rather over-match than under-match
+/// and rely on the reranker to drop the noise.
+fn rel_matches_query(rel: &str, q_tokens: &std::collections::HashSet<String>) -> bool {
+    if q_tokens.is_empty() {
+        // Empty token set: treat as "match everything" so callers that
+        // pass no query terms still get edges back.
+        return true;
+    }
+    let rel_tokens: Vec<String> = rel
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+    for rt in &rel_tokens {
+        for qt in q_tokens {
+            // Symmetric substring: either direction counts.
+            if rt.len() >= 3 && qt.len() >= 3 && (rt.contains(qt.as_str()) || qt.contains(rt.as_str())) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Best-effort text extraction from an event payload for embedding. Matches
