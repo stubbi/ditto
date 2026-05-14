@@ -21,7 +21,7 @@ use ditto_core::{
     SkillStatus, Slot, SupersedePolicy, TenantId,
 };
 use ditto_memory::search::{SearchQuery, SearchResult, VectorSearchQuery};
-use ditto_memory::storage::{Storage, StorageError, StorageResult};
+use ditto_memory::storage::{CascadeReport, Storage, StorageError, StorageResult};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -939,6 +939,51 @@ impl Storage for PostgresStorage {
             )));
         }
         Ok(())
+    }
+
+    async fn delete_node_cascade(
+        &self,
+        tenant_id: TenantId,
+        node_id: NodeId,
+    ) -> StorageResult<CascadeReport> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Other(format!("begin: {e}")))?;
+        let edges = sqlx::query(
+            "DELETE FROM nc_edge WHERE tenant_id = $1 AND (src = $2 OR dst = $2)",
+        )
+        .bind(tenant_id.0)
+        .bind(node_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Other(format!("delete edges cascade: {e}")))?;
+        let n = sqlx::query("DELETE FROM nc_node WHERE tenant_id = $1 AND node_id = $2")
+            .bind(tenant_id.0)
+            .bind(node_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Other(format!("delete node: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Other(format!("commit cascade: {e}")))?;
+        Ok(CascadeReport {
+            node_removed: n.rows_affected() > 0,
+            edges_removed: u32::try_from(edges.rows_affected()).unwrap_or(u32::MAX),
+        })
+    }
+
+    async fn delete_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
+        let n = sqlx::query(
+            "DELETE FROM blob WHERE tenant_id = $1 AND content_hash = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(&hash.0[..])
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Other(format!("delete_blob: {e}")))?;
+        Ok(n.rows_affected() > 0)
     }
 
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {

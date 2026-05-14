@@ -24,7 +24,7 @@ use ditto_core::{
 
 use crate::embedder::cosine;
 use crate::search::{SearchQuery, SearchResult, VectorSearchQuery};
-use crate::storage::{Storage, StorageError, StorageResult};
+use crate::storage::{CascadeReport, Storage, StorageError, StorageResult};
 
 #[derive(Default)]
 pub struct InMemoryStorage {
@@ -617,6 +617,38 @@ impl Storage for InMemoryStorage {
             .embeddings
             .insert((tenant_id, event_id), embedding.to_vec());
         Ok(())
+    }
+
+    async fn delete_node_cascade(
+        &self,
+        tenant_id: TenantId,
+        node_id: NodeId,
+    ) -> StorageResult<CascadeReport> {
+        let mut inner = self.inner.lock().unwrap();
+        let node_removed = inner
+            .nodes
+            .remove(&node_id)
+            .filter(|n| n.tenant_id == tenant_id)
+            .is_some();
+        let mut edges_removed = 0_u32;
+        inner.edges.retain(|_, e| {
+            let touches_node = e.src == node_id || e.dst == node_id;
+            if touches_node && e.tenant_id == tenant_id {
+                edges_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        Ok(CascadeReport {
+            node_removed,
+            edges_removed,
+        })
+    }
+
+    async fn delete_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner.blobs.remove(&(tenant_id, hash)).is_some())
     }
 
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>> {

@@ -29,7 +29,7 @@ use ditto_core::{
 
 use crate::embedder::Embedder;
 use crate::search::{SearchMode, SearchQuery, SearchResult, VectorSearchQuery};
-use crate::storage::{Storage, StorageError, StorageResult};
+use crate::storage::{CascadeReport, Storage, StorageError, StorageResult};
 
 #[derive(Clone, Copy)]
 pub enum SigningPolicy {
@@ -68,6 +68,28 @@ impl Authority {
             Authority::AgentContinuation => false,
         }
     }
+}
+
+/// Signed cryptographic proof of a deletion. The wrapped `receipt` is a
+/// normal `Receipt` over an event recording the deletion target + cascade
+/// counts; auditors verify the deletion happened with authority by
+/// re-validating the receipt against the install's verifying key (same as
+/// any other receipt). The `cascade` and `target` fields are surfaced for
+/// convenience but are also embedded in the event payload — the receipt
+/// is the canonical source.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeletionProof {
+    pub target: DeletionTarget,
+    pub tenant_id: TenantId,
+    pub cascade: CascadeReport,
+    pub receipt: Receipt,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeletionTarget {
+    Node(NodeId),
+    Blob(BlobHash),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -421,6 +443,105 @@ impl<S: Storage> MemoryController<S> {
             shadows.insert((tenant_id, event_id), receipt.event_id);
         }
         Ok(receipt)
+    }
+
+    // --- Verifiable cascade delete ---
+
+    /// Delete a node and cascade to its edges. Emits a signed `DeletionProof`
+    /// — a regular event in the `BlobStore` slot whose payload records the
+    /// target, timestamp, and cascade count. The proof is verifiable with
+    /// the install's verifying key; auditors can re-validate the deletion
+    /// happened with authority.
+    ///
+    /// Idempotent: a second delete of an already-removed node returns a new
+    /// proof with `node_removed = false, edges_removed = 0`. That's
+    /// deliberate — re-runnable deletion is essential for retry safety.
+    pub async fn delete_node(
+        &self,
+        tenant_id: TenantId,
+        scope_id: ScopeId,
+        node_id: NodeId,
+    ) -> StorageResult<DeletionProof> {
+        let cascade = self.storage.delete_node_cascade(tenant_id, node_id).await?;
+        let receipt = self
+            .emit_deletion_receipt(
+                tenant_id,
+                scope_id,
+                "delete_node",
+                serde_json::json!({
+                    "target_kind": "node",
+                    "target_id": node_id.to_string(),
+                    "cascade": cascade,
+                }),
+            )
+            .await?;
+        Ok(DeletionProof {
+            target: DeletionTarget::Node(node_id),
+            tenant_id,
+            cascade,
+            receipt,
+        })
+    }
+
+    /// Delete a blob from the tenant's CAS. Emits a signed DeletionProof.
+    /// Idempotent: returns a proof with `node_removed = false` when the
+    /// blob was already absent.
+    pub async fn delete_blob(
+        &self,
+        tenant_id: TenantId,
+        scope_id: ScopeId,
+        hash: BlobHash,
+    ) -> StorageResult<DeletionProof> {
+        let existed = self.storage.delete_blob(tenant_id, hash).await?;
+        let receipt = self
+            .emit_deletion_receipt(
+                tenant_id,
+                scope_id,
+                "delete_blob",
+                serde_json::json!({
+                    "target_kind": "blob",
+                    "target_id": hash.to_hex(),
+                    "existed": existed,
+                }),
+            )
+            .await?;
+        Ok(DeletionProof {
+            target: DeletionTarget::Blob(hash),
+            tenant_id,
+            cascade: CascadeReport {
+                node_removed: existed,
+                edges_removed: 0,
+            },
+            receipt,
+        })
+    }
+
+    async fn emit_deletion_receipt(
+        &self,
+        tenant_id: TenantId,
+        scope_id: ScopeId,
+        source_id: &str,
+        target_payload: Value,
+    ) -> StorageResult<Receipt> {
+        // Include the nanos timestamp inside the payload so two delete
+        // events for the same target produce distinct event_ids — without
+        // this, content-addressing would dedupe a second delete that the
+        // application explicitly wants logged.
+        let now = Utc::now();
+        let mut payload = target_payload;
+        if let Value::Object(map) = &mut payload {
+            let nanos = now.timestamp_nanos_opt().unwrap_or(0);
+            map.insert("_at_nanos".into(), serde_json::json!(nanos));
+        }
+        self.write(
+            tenant_id,
+            scope_id,
+            source_id.to_string(),
+            Slot::BlobStore,
+            payload,
+            now,
+        )
+        .await
     }
 
     /// Is the event currently within its labile window? Useful for callers
@@ -1831,6 +1952,124 @@ mod tests {
             .update(tenant, r.event_id, json!({"content": "v3"}), Authority::User)
             .await;
         assert!(matches!(err, Err(UpdateError::AlreadyShadowed { .. })));
+    }
+
+    // --- Verifiable cascade delete ---
+
+    #[tokio::test]
+    async fn delete_node_cascade_removes_edges_and_returns_signed_proof() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+
+        let alice = NodeId::new();
+        let bob = NodeId::new();
+        ctrl.assert_node(NewNode {
+            node_id: alice,
+            tenant_id: tenant,
+            scope_id: scope,
+            node_type: "person".into(),
+            properties: json!({"name": "Alice"}),
+            provenance: vec![],
+        })
+        .await
+        .unwrap();
+        ctrl.assert_node(NewNode {
+            node_id: bob,
+            tenant_id: tenant,
+            scope_id: scope,
+            node_type: "person".into(),
+            properties: json!({"name": "Bob"}),
+            provenance: vec![],
+        })
+        .await
+        .unwrap();
+        ctrl.write_fact(NewEdge {
+            edge_id: EdgeId::new(),
+            src: alice,
+            dst: bob,
+            rel: "knows".into(),
+            strength: Some(1.0),
+            tenant_id: tenant,
+            scope_id: scope,
+            t_valid: t(2026, 1, 1),
+            t_invalid: None,
+            supersede: None,
+            provenance: vec![],
+        })
+        .await
+        .unwrap();
+
+        let proof = ctrl.delete_node(tenant, scope, alice).await.unwrap();
+        assert!(proof.cascade.node_removed);
+        assert_eq!(proof.cascade.edges_removed, 1);
+        match proof.target {
+            DeletionTarget::Node(n) => assert_eq!(n, alice),
+            other => panic!("expected Node target, got {other:?}"),
+        }
+        // Receipt is signed and re-verifiable.
+        assert!(proof.receipt.signature.is_some());
+        assert!(ctrl.verify(&proof.receipt).await.unwrap());
+
+        // The node is gone.
+        assert!(ctrl.get_node(alice).await.unwrap().is_none());
+        // Its edges are gone.
+        let edges = ctrl
+            .current_edges_from(tenant, alice, None)
+            .await
+            .unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_node_is_idempotent() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let ghost = NodeId::new();
+        // No node exists — first delete returns a proof for a no-op.
+        let proof = ctrl.delete_node(tenant, scope, ghost).await.unwrap();
+        assert!(!proof.cascade.node_removed);
+        assert_eq!(proof.cascade.edges_removed, 0);
+        // Receipt still signed; the deletion-event audit log records the attempt.
+        assert!(proof.receipt.signature.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_blob_emits_signed_proof_and_purges_content() {
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let h = ctrl
+            .put_blob(tenant, &Blob::text("doomed"))
+            .await
+            .unwrap();
+        assert!(ctrl.has_blob(tenant, h).await.unwrap());
+        let proof = ctrl.delete_blob(tenant, scope, h).await.unwrap();
+        match proof.target {
+            DeletionTarget::Blob(bh) => assert_eq!(bh, h),
+            other => panic!("expected Blob target, got {other:?}"),
+        }
+        // node_removed=true here just means "blob existed before delete".
+        assert!(proof.cascade.node_removed);
+        assert!(!ctrl.has_blob(tenant, h).await.unwrap());
+        assert!(ctrl.verify(&proof.receipt).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deletion_receipts_for_same_target_have_distinct_event_ids() {
+        // Each delete-event payload embeds a nanos timestamp so two deletes
+        // of the same target are not deduped by content-addressing — the
+        // audit log records every attempt.
+        let ctrl = ctrl();
+        let tenant = TenantId::new();
+        let scope = ScopeId::new();
+        let node = NodeId::new();
+        let p1 = ctrl.delete_node(tenant, scope, node).await.unwrap();
+        // Small sleep to ensure nanos differ.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let p2 = ctrl.delete_node(tenant, scope, node).await.unwrap();
+        assert_ne!(p1.receipt.event_id, p2.receipt.event_id);
     }
 
     #[tokio::test]

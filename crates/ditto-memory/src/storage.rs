@@ -255,4 +255,31 @@ pub trait Storage: Send + Sync {
     /// `score` is the cosine similarity in [-1.0, 1.0]; backends that
     /// compute distance instead must convert (1 - distance).
     async fn search_vector(&self, query: &VectorSearchQuery) -> StorageResult<Vec<SearchResult>>;
+
+    // --- Verifiable deletion ---
+
+    /// Delete a node and all its edges (incoming + outgoing, current and
+    /// historical) in one atomic transaction. Idempotent: deleting a node
+    /// that no longer exists returns `cascade.node_removed = false` with
+    /// `edges_removed = 0`, not an error — this lets retries be safe.
+    ///
+    /// Returns the count of records removed alongside, which the controller
+    /// folds into the signed DeletionProof payload.
+    async fn delete_node_cascade(
+        &self,
+        tenant_id: TenantId,
+        node_id: NodeId,
+    ) -> StorageResult<CascadeReport>;
+
+    /// Delete a blob from the tenant's CAS. Returns true when the blob
+    /// existed and was removed, false when it was already absent.
+    async fn delete_blob(&self, tenant_id: TenantId, hash: BlobHash) -> StorageResult<bool>;
+}
+
+/// Side effects of a cascade delete — folded into the DeletionProof payload
+/// so an auditor can verify "deleting node X removed N edges, M reflections".
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CascadeReport {
+    pub node_removed: bool,
+    pub edges_removed: u32,
 }
