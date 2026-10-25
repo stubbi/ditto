@@ -340,7 +340,7 @@ Required from day 1 for serious developers (work + personal Copilot, multiple Cl
 ```
 $ ditto auth list
   github-copilot (default)  jannes@aqora.io
-  github-copilot            work@paperclip.inc
+  github-copilot            work@example.com
   anthropic-console         ditto-prod
   chatgpt                   jannes-personal
 
